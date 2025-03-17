@@ -12,6 +12,8 @@
 #include "output.h"
 #include "rtltcp.h"
 
+extern pthread_mutex_t fftw_mutex;
+
 struct nrsc5_t
 {
     rtlsdr_dev_t *dev;
@@ -22,8 +24,6 @@ struct nrsc5_t
     int mode;
     int gain;
     int auto_gain;
-    int auto_gain_snr_ready;
-    float auto_gain_snr;
     int stopped;
     int worker_stopped;
     int closed;

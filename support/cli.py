@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import queue
+import signal
 import sys
 import threading
 import wave
@@ -20,9 +21,20 @@ class NRSC5CLI:
         self.parse_args()
         self.audio_queue = queue.Queue(maxsize=64)
         self.device_condition = threading.Condition()
+        self.interrupted = False
         self.iq_output = None
         self.wav_output = None
+        self.raw_output = None
         self.hdc_output = None
+        self.audio_packets = 0
+        self.audio_bytes = 0
+        signal.signal(signal.SIGINT, self._signal_handler)
+
+    def _signal_handler(self, sig, frame):
+        logging.info("Stopping...")
+        self.interrupted = True
+        with self.device_condition:
+            self.device_condition.notify()
 
     def parse_args(self):
         parser = argparse.ArgumentParser(description="Receive NRSC-5 signals.")
@@ -32,13 +44,14 @@ class NRSC5CLI:
         parser.add_argument("--am", action="store_true")
         parser.add_argument("-l", metavar="log-level", type=int, default=1)
         parser.add_argument("-d", metavar="device-index", type=int, default=0)
+        parser.add_argument("-H", metavar="rtltcp-host")
         parser.add_argument("-p", metavar="ppm-error", type=int)
         parser.add_argument("-g", metavar="gain", type=float)
         input_group.add_argument("-r", metavar="iq-input")
         parser.add_argument("--iq-input-format", choices=["cu8", "cs16"], default="cu8")
         parser.add_argument("-w", metavar="iq-output")
-        parser.add_argument("-o", metavar="wav-output")
-        parser.add_argument("-H", metavar="rtltcp-host")
+        parser.add_argument("-o", metavar="audio-output")
+        parser.add_argument("-t", choices=["wav", "raw"], default="wav")
         parser.add_argument("-T", action="store_true")
         parser.add_argument("-D", metavar="direct-sampling-mode", type=int, default=-1)
         parser.add_argument("--dump-hdc", metavar="hdc-output")
@@ -89,10 +102,14 @@ class NRSC5CLI:
             self.iq_output = sys.stdout.buffer if self.args.w == "-" else open(self.args.w, "wb")
 
         if self.args.o:
-            self.wav_output = wave.open(self.args.o, "wb")
-            self.wav_output.setnchannels(2)
-            self.wav_output.setsampwidth(2)
-            self.wav_output.setframerate(44100)
+            if self.args.t == "wav":
+                self.wav_output = wave.open(sys.stdout.buffer if self.args.o == "-" else self.args.o, "wb")
+                self.wav_output.setnchannels(2)
+                self.wav_output.setsampwidth(2)
+                self.wav_output.setframerate(nrsc5.SAMPLE_RATE_AUDIO)
+                self.wav_output.setnframes((1 << 30) - 64)
+            elif self.args.t == "raw":
+                self.raw_output = sys.stdout.buffer if self.args.o == "-" else open(self.args.o, "wb")
         else:
             audio_thread = threading.Thread(target=self.audio_worker)
             audio_thread.start()
@@ -104,7 +121,7 @@ class NRSC5CLI:
 
         try:
             if self.args.r:
-                while True:
+                while not self.interrupted:
                     data = iq_input.read(32768)
                     if not data:
                         break
@@ -115,8 +132,6 @@ class NRSC5CLI:
             else:
                 with self.device_condition:
                     self.device_condition.wait()
-        except KeyboardInterrupt:
-            logging.info("Stopping...")
         except nrsc5.NRSC5Error as err:
             logging.error(err)
 
@@ -131,7 +146,10 @@ class NRSC5CLI:
             self.iq_output.close()
 
         if self.args.o:
-            self.wav_output.close()
+            if self.args.t == "wav":
+                self.wav_output.close()
+            elif self.args.t == "raw":
+                self.raw_output.close()
         else:
             self.audio_queue.put(None)
             audio_thread.join()
@@ -145,7 +163,7 @@ class NRSC5CLI:
             index = audio.get_default_output_device_info()["index"]
             stream = audio.open(format=pyaudio.paInt16,
                                 channels=2,
-                                rate=44100,
+                                rate=nrsc5.SAMPLE_RATE_AUDIO,
                                 output_device_index=index,
                                 output=True)
         except OSError:
@@ -194,14 +212,28 @@ class NRSC5CLI:
         elif evt_type == nrsc5.EventType.BER:
             logging.info("BER: %.6f", evt.cber)
         elif evt_type == nrsc5.EventType.HDC:
-            if self.args.dump_hdc:
-                if evt.program == self.args.program:
+            if evt.program == self.args.program:
+                if self.args.dump_hdc:
                     self.hdc_output.write(self.adts_header(len(evt.data)))
                     self.hdc_output.write(evt.data)
+
+                self.audio_packets += 1
+                self.audio_bytes += len(evt.data)
+                if self.audio_packets >= 32:
+                    logging.info("Audio bit rate: %.1f kbps", self.audio_bytes * 8 * nrsc5.SAMPLE_RATE_AUDIO
+                                 / nrsc5.AUDIO_FRAME_SAMPLES / self.audio_packets / 1000)
+                    self.audio_packets = 0
+                    self.audio_bytes = 0
         elif evt_type == nrsc5.EventType.AUDIO:
             if evt.program == self.args.program:
                 if self.args.o:
-                    self.wav_output.writeframes(evt.data)
+                    if self.args.t == "wav":
+                        try:
+                            self.wav_output.writeframes(evt.data)
+                        except OSError:
+                            pass
+                    elif self.args.t == "raw":
+                        self.raw_output.write(evt.data)
                 else:
                     self.audio_queue.put(evt.data)
         elif evt_type == nrsc5.EventType.ID3:
@@ -218,31 +250,31 @@ class NRSC5CLI:
                     logging.info("Unique file identifier: %s %s", evt.ufid.owner, evt.ufid.id)
                 if evt.xhdr:
                     logging.info("XHDR: param=%s mime=%s lot=%s",
-                                 evt.xhdr.param, evt.xhdr.mime, evt.xhdr.lot)
+                                 evt.xhdr.param, evt.xhdr.mime.name, evt.xhdr.lot)
         elif evt_type == nrsc5.EventType.SIG:
             for service in evt:
                 logging.info("SIG Service: type=%s number=%s name=%s",
-                             service.type, service.number, service.name)
+                             service.type.name, service.number, service.name)
                 for component in service.components:
                     if component.type == nrsc5.ComponentType.AUDIO:
                         logging.info("  Audio component: id=%s port=%04X type=%s mime=%s",
                                      component.id, component.audio.port,
-                                     component.audio.type, component.audio.mime)
+                                     component.audio.type.name, component.audio.mime.name)
                     elif component.type == nrsc5.ComponentType.DATA:
                         logging.info("  Data component: id=%s port=%04X service_data_type=%s type=%s mime=%s",
                                      component.id, component.data.port,
-                                     component.data.service_data_type,
-                                     component.data.type, component.data.mime)
+                                     component.data.service_data_type.name,
+                                     component.data.type, component.data.mime.name)
         elif evt_type == nrsc5.EventType.STREAM:
             logging.info("Stream data: port=%04X seq=%04X mime=%s size=%s",
-                         evt.port, evt.seq, evt.mime, len(evt.data))
+                         evt.port, evt.seq, evt.mime.name, len(evt.data))
         elif evt_type == nrsc5.EventType.PACKET:
             logging.info("Packet data: port=%04X seq=%04X mime=%s size=%s",
-                         evt.port, evt.seq, evt.mime, len(evt.data))
+                         evt.port, evt.seq, evt.mime.name, len(evt.data))
         elif evt_type == nrsc5.EventType.LOT:
             time_str = evt.expiry_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
             logging.info("LOT file: port=%04X lot=%s name=%s size=%s mime=%s expiry=%s",
-                         evt.port, evt.lot, evt.name, len(evt.data), evt.mime, time_str)
+                         evt.port, evt.lot, evt.name, len(evt.data), evt.mime.name, time_str)
             if self.args.dump_aas_files:
                 path = os.path.join(self.args.dump_aas_files, evt.name)
                 with open(path, "wb") as file:
@@ -260,17 +292,17 @@ class NRSC5CLI:
             if evt.alert:
                 logging.info("Alert: %s", evt.alert)
             if evt.latitude:
-                logging.info("Station location: %s, %s, %sm",
+                logging.info("Station location: %.4f, %.4f, %dm",
                              evt.latitude, evt.longitude, evt.altitude)
             for audio_service in evt.audio_services:
                 logging.info("Audio program %s: %s, type: %s, sound experience %s",
                              audio_service.program,
-                             "public" if audio_service.access == nrsc5.Access.PUBLIC else "restricted",
+                             audio_service.access.name,
                              self.radio.program_type_name(audio_service.type),
                              audio_service.sound_exp)
             for data_service in evt.data_services:
                 logging.info("Data service: %s, type: %s, MIME type %03x",
-                             "public" if data_service.access == nrsc5.Access.PUBLIC else "restricted",
+                             data_service.access.name,
                              self.radio.service_data_type_name(data_service.type),
                              data_service.mime_type)
 

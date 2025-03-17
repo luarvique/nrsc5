@@ -19,6 +19,7 @@
 #include "acquire.h"
 #include "defines.h"
 #include "input.h"
+#include "private.h"
 
 #define FILTER_DELAY 15
 #define DECIMATION_FACTOR_FM 2
@@ -99,9 +100,9 @@ void acquire_process(acquire_t *st)
     float complex max_v = 0, phase_increment;
     float angle, angle_diff, angle_factor, max_mag = -1.0f;
     int samperr = 0;
-    unsigned int i, j, keep;
+    int i, j, keep;
 
-    if (st->idx != st->fftcp * (ACQUIRE_SYMBOLS + 1))
+    if (st->idx != (unsigned int)st->fftcp * (ACQUIRE_SYMBOLS + 1))
         return;
 
     if (st->input->sync_state == SYNC_STATE_FINE)
@@ -266,7 +267,7 @@ void acquire_cfo_adjust(acquire_t *st, int cfo)
         return;
 
     st->cfo += cfo;
-    hz = (float) st->cfo * SAMPLE_RATE / st->fft;
+    hz = (float) st->cfo * NRSC5_SAMPLE_RATE_CU8 / st->fft;
     hz /= (st->mode == NRSC5_MODE_FM ? DECIMATION_FACTOR_FM : DECIMATION_FACTOR_AM);
 
     log_info("CFO: %f Hz", hz);
@@ -309,8 +310,10 @@ void acquire_init(acquire_t *st, input_t *input)
     st->filter_fm = firdecim_q15_create(filter_taps_fm, sizeof(filter_taps_fm) / sizeof(filter_taps_fm[0]));
     st->filter_am = firdecim_q15_create(filter_taps_am, sizeof(filter_taps_am) / sizeof(filter_taps_am[0]));
 
+    pthread_mutex_lock(&fftw_mutex);
     st->fft_plan_fm = fftwf_plan_dft_1d(FFT_FM, st->fftin, st->fftout, FFTW_FORWARD, 0);
     st->fft_plan_am = fftwf_plan_dft_1d(FFT_AM, st->fftin, st->fftout, FFTW_FORWARD, 0);
+    pthread_mutex_unlock(&fftw_mutex);
 
     for (i = 0; i < FFTCP_FM; ++i)
     {
@@ -363,6 +366,9 @@ void acquire_free(acquire_t *st)
 {
     firdecim_q15_free(st->filter_fm);
     firdecim_q15_free(st->filter_am);
+
+    pthread_mutex_lock(&fftw_mutex);
     fftwf_destroy_plan(st->fft_plan_fm);
     fftwf_destroy_plan(st->fft_plan_am);
+    pthread_mutex_unlock(&fftw_mutex);
 }

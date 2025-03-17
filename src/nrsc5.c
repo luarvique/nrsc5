@@ -3,19 +3,7 @@
 
 #include "private.h"
 
-#ifdef __MINGW32__
-#define NRSC5_API __declspec(dllexport)
-#else
-#define NRSC5_API
-#endif
-
-static int snr_callback(void *arg, float snr)
-{
-    nrsc5_t *st = arg;
-    st->auto_gain_snr_ready = 1;
-    st->auto_gain_snr = snr;
-    return 1;
-}
+pthread_mutex_t fftw_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int get_tuner_gains(nrsc5_t *st, int *gains)
 {
@@ -37,9 +25,7 @@ static int do_auto_gain(nrsc5_t *st)
 {
     int gain_count, best_gain = 0, ret = 1;
     int *gain_list = NULL;
-    float best_snr = 0;
-
-    input_set_snr_callback(&st->input, snr_callback, st);
+    float best_amplitude_db = 0.0f;
 
     gain_count = get_tuner_gains(st, NULL);
     if (gain_count < 0)
@@ -64,45 +50,50 @@ static int do_auto_gain(nrsc5_t *st)
         {
             // there is no good way to wait for samples after the new gain was applied
             // dump 250ms of samples and hope for the best
-            rtltcp_reset_buffer(st->rtltcp, (SAMPLE_RATE / 4) * 2);
+            rtltcp_reset_buffer(st->rtltcp, (NRSC5_SAMPLE_RATE_CU8 / 4) * 2);
         }
 
-        st->auto_gain_snr_ready = 0;
-        while (!st->auto_gain_snr_ready)
+        int len = sizeof(st->samples_buf);
+
+        if (st->dev)
         {
-            int len = sizeof(st->samples_buf);
-
-            if (st->dev)
-            {
-                if (rtlsdr_read_sync(st->dev, st->samples_buf, len, &len) != 0)
-                    goto error;
-            }
-            else
-            {
-                assert(st->rtltcp);
-                if (rtltcp_read(st->rtltcp, st->samples_buf, len) != len)
-                    goto error;
-            }
-
-            input_push_cu8(&st->input, st->samples_buf, len);
+            if (rtlsdr_read_sync(st->dev, st->samples_buf, len, &len) != 0)
+                goto error;
         }
-        log_debug("Gain: %.1f dB, CNR: %.1f dB", gain / 10.0f, 10 * log10f(st->auto_gain_snr));
-        if (st->auto_gain_snr > best_snr)
+        else
         {
-            best_snr = st->auto_gain_snr;
+            assert(st->rtltcp);
+            if (rtltcp_read(st->rtltcp, st->samples_buf, len) != len)
+                goto error;
+        }
+
+        uint8_t max_sample = 0;
+        uint8_t min_sample = 255;
+        for (int j = 0; j < len; j++)
+        {
+            if (st->samples_buf[j] > max_sample)
+                max_sample = st->samples_buf[j];
+            if (st->samples_buf[j] < min_sample)
+                min_sample = st->samples_buf[j];
+        }
+
+        float amplitude_db = 20 * log10f((max_sample - min_sample + 1) / 256.0f);
+        log_debug("Gain: %.1f dB, Peak amplitude: %.1f dBFS", gain / 10.0f, amplitude_db);
+
+        if ((i == 0) || (amplitude_db < -6.0f))
+        {
             best_gain = gain;
+            best_amplitude_db = amplitude_db;
         }
-        input_reset(&st->input);
     }
 
-    log_debug("Best gain: %.1f dB, CNR: %.1f dB", best_gain / 10.0f, 10 * log10f(best_snr));
+    log_debug("Best gain: %.1f dB, Peak amplitude: %.1f dBFS", best_gain / 10.0f, best_amplitude_db);
     st->gain = best_gain;
     set_tuner_gain(st, best_gain);
     ret = 0;
 
 error:
     free(gain_list);
-    input_set_snr_callback(&st->input, NULL, NULL);
     return ret;
 }
 
@@ -223,12 +214,12 @@ static void nrsc5_init(nrsc5_t *st)
     }
 }
 
-NRSC5_API void nrsc5_get_version(const char **version)
+void nrsc5_get_version(const char **version)
 {
     *version = GIT_COMMIT_HASH;
 }
 
-NRSC5_API void nrsc5_service_data_type_name(unsigned int type, const char **name)
+void nrsc5_service_data_type_name(unsigned int type, const char **name)
 {
     switch (type)
     {
@@ -255,7 +246,7 @@ NRSC5_API void nrsc5_service_data_type_name(unsigned int type, const char **name
     }
 }
 
-NRSC5_API void nrsc5_program_type_name(unsigned int type, const char **name)
+void nrsc5_program_type_name(unsigned int type, const char **name)
 {
     switch (type)
     {
@@ -301,7 +292,7 @@ static nrsc5_t *nrsc5_alloc()
     return st;
 }
 
-NRSC5_API int nrsc5_open(nrsc5_t **result, int device_index)
+int nrsc5_open(nrsc5_t **result, int device_index)
 {
     int err;
     nrsc5_t *st = nrsc5_alloc();
@@ -309,7 +300,7 @@ NRSC5_API int nrsc5_open(nrsc5_t **result, int device_index)
     if (rtlsdr_open(&st->dev, device_index) != 0)
         goto error_init;
 
-    err = rtlsdr_set_sample_rate(st->dev, SAMPLE_RATE);
+    err = rtlsdr_set_sample_rate(st->dev, NRSC5_SAMPLE_RATE_CU8);
     if (err) goto error;
     err = rtlsdr_set_tuner_gain_mode(st->dev, 1);
     if (err) goto error;
@@ -330,7 +321,7 @@ error_init:
     return 1;
 }
 
-NRSC5_API int nrsc5_open_file(nrsc5_t **result, FILE *fp)
+int nrsc5_open_file(nrsc5_t **result, FILE *fp)
 {
     nrsc5_t *st = nrsc5_alloc();
     st->iq_file = fp;
@@ -340,7 +331,7 @@ NRSC5_API int nrsc5_open_file(nrsc5_t **result, FILE *fp)
     return 0;
 }
 
-NRSC5_API int nrsc5_open_pipe(nrsc5_t **result)
+int nrsc5_open_pipe(nrsc5_t **result)
 {
     nrsc5_t *st = nrsc5_alloc();
     nrsc5_init(st);
@@ -349,7 +340,7 @@ NRSC5_API int nrsc5_open_pipe(nrsc5_t **result)
     return 0;
 }
 
-NRSC5_API int nrsc5_open_rtltcp(nrsc5_t **result, int socket)
+int nrsc5_open_rtltcp(nrsc5_t **result, int socket)
 {
     int err;
     nrsc5_t *st = nrsc5_alloc();
@@ -358,7 +349,7 @@ NRSC5_API int nrsc5_open_rtltcp(nrsc5_t **result, int socket)
     if (st->rtltcp == NULL)
         goto error;
 
-    err = rtltcp_set_sample_rate(st->rtltcp, SAMPLE_RATE);
+    err = rtltcp_set_sample_rate(st->rtltcp, NRSC5_SAMPLE_RATE_CU8);
     if (err) goto error;
     err = rtltcp_set_tuner_gain_mode(st->rtltcp, 1);
     if (err) goto error;
@@ -375,7 +366,7 @@ error:
     return 1;
 }
 
-NRSC5_API void nrsc5_close(nrsc5_t *st)
+void nrsc5_close(nrsc5_t *st)
 {
     if (!st)
         return;
@@ -404,7 +395,7 @@ NRSC5_API void nrsc5_close(nrsc5_t *st)
     free(st);
 }
 
-NRSC5_API void nrsc5_start(nrsc5_t *st)
+void nrsc5_start(nrsc5_t *st)
 {
     if (using_worker(st))
     {
@@ -416,7 +407,7 @@ NRSC5_API void nrsc5_start(nrsc5_t *st)
     }
 }
 
-NRSC5_API void nrsc5_stop(nrsc5_t *st)
+void nrsc5_stop(nrsc5_t *st)
 {
     if (using_worker(st))
     {
@@ -434,7 +425,7 @@ NRSC5_API void nrsc5_stop(nrsc5_t *st)
     }
 }
 
-NRSC5_API int nrsc5_set_mode(nrsc5_t *st, int mode)
+int nrsc5_set_mode(nrsc5_t *st, int mode)
 {
     if (mode == NRSC5_MODE_FM || mode == NRSC5_MODE_AM)
     {
@@ -445,7 +436,7 @@ NRSC5_API int nrsc5_set_mode(nrsc5_t *st, int mode)
     return 1;
 }
 
-NRSC5_API int nrsc5_set_bias_tee(nrsc5_t *st, int on)
+int nrsc5_set_bias_tee(nrsc5_t *st, int on)
 {
     if (st->dev)
     {
@@ -462,7 +453,7 @@ NRSC5_API int nrsc5_set_bias_tee(nrsc5_t *st, int on)
     return 0;
 }
 
-NRSC5_API int nrsc5_set_direct_sampling(nrsc5_t *st, int on)
+int nrsc5_set_direct_sampling(nrsc5_t *st, int on)
 {
     if (st->dev)
     {
@@ -479,7 +470,7 @@ NRSC5_API int nrsc5_set_direct_sampling(nrsc5_t *st, int on)
     return 0;
 }
 
-NRSC5_API int nrsc5_set_freq_correction(nrsc5_t *st, int ppm_error)
+int nrsc5_set_freq_correction(nrsc5_t *st, int ppm_error)
 {
     if (st->dev)
     {
@@ -496,7 +487,7 @@ NRSC5_API int nrsc5_set_freq_correction(nrsc5_t *st, int ppm_error)
     return 0;
 }
 
-NRSC5_API void nrsc5_get_frequency(nrsc5_t *st, float *freq)
+void nrsc5_get_frequency(nrsc5_t *st, float *freq)
 {
     if (st->dev)
         *freq = rtlsdr_get_center_freq(st->dev);
@@ -504,7 +495,7 @@ NRSC5_API void nrsc5_get_frequency(nrsc5_t *st, float *freq)
         *freq = st->freq;
 }
 
-NRSC5_API int nrsc5_set_frequency(nrsc5_t *st, float freq)
+int nrsc5_set_frequency(nrsc5_t *st, float freq)
 {
     if (st->freq == freq)
         return 0;
@@ -525,7 +516,7 @@ NRSC5_API int nrsc5_set_frequency(nrsc5_t *st, float freq)
     return 0;
 }
 
-NRSC5_API void nrsc5_get_gain(nrsc5_t *st, float *gain)
+void nrsc5_get_gain(nrsc5_t *st, float *gain)
 {
     if (st->dev)
         *gain = rtlsdr_get_tuner_gain(st->dev) / 10.0f;
@@ -533,7 +524,7 @@ NRSC5_API void nrsc5_get_gain(nrsc5_t *st, float *gain)
         *gain = st->gain;
 }
 
-NRSC5_API int nrsc5_set_gain(nrsc5_t *st, float gain)
+int nrsc5_set_gain(nrsc5_t *st, float gain)
 {
     if (st->gain == gain)
         return 0;
@@ -549,13 +540,13 @@ NRSC5_API int nrsc5_set_gain(nrsc5_t *st, float gain)
     return 0;
 }
 
-NRSC5_API void nrsc5_set_auto_gain(nrsc5_t *st, int enabled)
+void nrsc5_set_auto_gain(nrsc5_t *st, int enabled)
 {
     st->auto_gain = enabled;
     st->gain = -1;
 }
 
-NRSC5_API void nrsc5_set_callback(nrsc5_t *st, nrsc5_callback_t callback, void *opaque)
+void nrsc5_set_callback(nrsc5_t *st, nrsc5_callback_t callback, void *opaque)
 {
     if (using_worker(st))
         pthread_mutex_lock(&st->worker_mutex);
@@ -565,7 +556,7 @@ NRSC5_API void nrsc5_set_callback(nrsc5_t *st, nrsc5_callback_t callback, void *
         pthread_mutex_unlock(&st->worker_mutex);
 }
 
-NRSC5_API int nrsc5_pipe_samples_cu8(nrsc5_t *st, const uint8_t *samples, unsigned int length)
+int nrsc5_pipe_samples_cu8(nrsc5_t *st, const uint8_t *samples, unsigned int length)
 {
     unsigned int sample_groups;
 
@@ -597,7 +588,7 @@ NRSC5_API int nrsc5_pipe_samples_cu8(nrsc5_t *st, const uint8_t *samples, unsign
     return 0;
 }
 
-NRSC5_API int nrsc5_pipe_samples_cs16(nrsc5_t *st, const int16_t *samples, unsigned int length)
+int nrsc5_pipe_samples_cs16(nrsc5_t *st, const int16_t *samples, unsigned int length)
 {
     unsigned int sample_groups;
 

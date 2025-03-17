@@ -1,4 +1,4 @@
-add_compile_options (--std=gnu11 -O3 -Wall)
+add_compile_options (--std=gnu11 -O3 -Wall -Wextra)
 
 add_definitions (-D_GNU_SOURCE)
 set (THREAD_LIBRARY pthread)
@@ -82,6 +82,7 @@ target_link_libraries (
 )
 set_target_properties(nrsc5 PROPERTIES PUBLIC_HEADER "../include/nrsc5.h")
 set_target_properties(nrsc5 PROPERTIES LINK_FLAGS "${STATIC_LINKER_FLAGS} ${EXPORTS_LINKER_FLAGS}")
+target_compile_definitions(nrsc5 PUBLIC "-DNRSC5_EXPORTS=1")
 
 add_library (
     nrsc5_static
