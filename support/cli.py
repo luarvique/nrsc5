@@ -19,15 +19,17 @@ class NRSC5CLI:
         self.radio = nrsc5.NRSC5(lambda evt_type, evt: self.callback(evt_type, evt))
         self.nrsc5_version = self.radio.get_version()
         self.parse_args()
-        self.audio_queue = queue.Queue(maxsize=64)
+        self.audio_queue = queue.Queue(maxsize=16)
         self.device_condition = threading.Condition()
         self.interrupted = False
         self.iq_output = None
         self.wav_output = None
         self.raw_output = None
         self.hdc_output = None
+        self.audio_packets_valid = 0
         self.audio_packets = 0
         self.audio_bytes = 0
+        self.audio_errors = 0
         signal.signal(signal.SIGINT, self._signal_handler)
 
     def _signal_handler(self, sig, frame):
@@ -42,7 +44,7 @@ class NRSC5CLI:
         parser.add_argument("-v", action="version", version="nrsc5 revision " + self.nrsc5_version)
         parser.add_argument("-q", action="store_true")
         parser.add_argument("--am", action="store_true")
-        parser.add_argument("-l", metavar="log-level", type=int, default=1)
+        parser.add_argument("-l", metavar="log-level", type=int, default=2)
         parser.add_argument("-d", metavar="device-index", type=int, default=0)
         parser.add_argument("-H", metavar="rtltcp-host")
         parser.add_argument("-p", metavar="ppm-error", type=int)
@@ -200,11 +202,18 @@ class NRSC5CLI:
             logging.info("Lost device")
             with self.device_condition:
                 self.device_condition.notify()
+        elif evt_type == nrsc5.EventType.AGC:
+            if evt.is_final:
+                logging.info("Best gain: %.1f dB, Peak amplitude: %.1f dBFS", evt.gain_db, evt.peak_dbfs)
+            else:
+                logging.debug("Gain: %.1f dB, Peak amplitude: %.1f dBFS", evt.gain_db, evt.peak_dbfs)
         elif evt_type == nrsc5.EventType.IQ:
             if self.args.w:
                 self.iq_output.write(evt.data)
         elif evt_type == nrsc5.EventType.SYNC:
             logging.info("Synchronized")
+            logging.info("Frequency offset: %.0f Hz", evt.freq_offset)
+            logging.info("Primary service mode: %d", evt.psmi)
         elif evt_type == nrsc5.EventType.LOST_SYNC:
             logging.info("Lost synchronization")
         elif evt_type == nrsc5.EventType.MER:
@@ -219,11 +228,21 @@ class NRSC5CLI:
 
                 self.audio_packets += 1
                 self.audio_bytes += len(evt.data)
-                if self.audio_packets >= 32:
+                if evt.flags & nrsc5.PacketFlags.CRC_ERROR:
+                    self.audio_errors += 1
+                else:
+                    self.audio_packets_valid += 1
+
+                if self.audio_packets_valid >= 32:
                     logging.info("Audio bit rate: %.1f kbps", self.audio_bytes * 8 * nrsc5.SAMPLE_RATE_AUDIO
-                                 / nrsc5.AUDIO_FRAME_SAMPLES / self.audio_packets / 1000)
-                    self.audio_packets = 0
+                                 / nrsc5.AUDIO_FRAME_SAMPLES / self.audio_packets_valid / 1000)
+                    self.audio_packets_valid = 0
                     self.audio_bytes = 0
+                if self.audio_packets >= 32:
+                    if self.audio_errors > 0:
+                        logging.warning("Audio packet CRC mismatches: %d", self.audio_errors)
+                    self.audio_packets = 0
+                    self.audio_errors = 0
         elif evt_type == nrsc5.EventType.AUDIO:
             if evt.program == self.args.program:
                 if self.args.o:
@@ -246,6 +265,8 @@ class NRSC5CLI:
                     logging.info("Album: %s", evt.album)
                 if evt.genre:
                     logging.info("Genre: %s", evt.genre)
+                for comment in evt.comments:
+                    logging.info("Comment: lang=%s %s %s", comment.lang, comment.short_content_desc, comment.full_text)
                 if evt.ufid:
                     logging.info("Unique file identifier: %s %s", evt.ufid.owner, evt.ufid.id)
                 if evt.xhdr:
@@ -264,47 +285,82 @@ class NRSC5CLI:
                         logging.info("  Data component: id=%s port=%04X service_data_type=%s type=%s mime=%s",
                                      component.id, component.data.port,
                                      component.data.service_data_type.name,
-                                     component.data.type, component.data.mime.name)
+                                     component.data.type.name, component.data.mime.name)
         elif evt_type == nrsc5.EventType.STREAM:
-            logging.info("Stream data: port=%04X seq=%04X mime=%s size=%s",
-                         evt.port, evt.seq, evt.mime.name, len(evt.data))
+            logging.debug("Stream data: port=%04X seq=%04X mime=%s size=%s",
+                          evt.component.data.port, evt.seq, evt.component.data.mime.name, len(evt.data))
         elif evt_type == nrsc5.EventType.PACKET:
-            logging.info("Packet data: port=%04X seq=%04X mime=%s size=%s",
-                         evt.port, evt.seq, evt.mime.name, len(evt.data))
+            logging.debug("Packet data: port=%04X seq=%04X mime=%s size=%s",
+                          evt.component.data.port, evt.seq, evt.component.data.mime.name, len(evt.data))
         elif evt_type == nrsc5.EventType.LOT:
-            time_str = evt.expiry_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-            logging.info("LOT file: port=%04X lot=%s name=%s size=%s mime=%s expiry=%s",
-                         evt.port, evt.lot, evt.name, len(evt.data), evt.mime.name, time_str)
             if self.args.dump_aas_files:
                 path = os.path.join(self.args.dump_aas_files, evt.name)
-                with open(path, "wb") as file:
-                    file.write(evt.data)
-        elif evt_type == nrsc5.EventType.SIS:
-            if evt.country_code:
-                logging.info("Country: %s, FCC facility ID: %s",
-                             evt.country_code, evt.fcc_facility_id)
-            if evt.name:
-                logging.info("Station name: %s", evt.name)
-            if evt.slogan:
-                logging.info("Slogan: %s", evt.slogan)
-            if evt.message:
-                logging.info("Message: %s", evt.message)
-            if evt.alert:
-                logging.info("Alert: %s", evt.alert)
-            if evt.latitude:
-                logging.info("Station location: %.4f, %.4f, %dm",
-                             evt.latitude, evt.longitude, evt.altitude)
-            for audio_service in evt.audio_services:
-                logging.info("Audio program %s: %s, type: %s, sound experience %s",
-                             audio_service.program,
-                             audio_service.access.name,
-                             self.radio.program_type_name(audio_service.type),
-                             audio_service.sound_exp)
-            for data_service in evt.data_services:
-                logging.info("Data service: %s, type: %s, MIME type %03x",
-                             data_service.access.name,
-                             self.radio.service_data_type_name(data_service.type),
-                             data_service.mime_type)
+                try:
+                    with open(path, "wb") as file:
+                        file.write(evt.data)
+                except OSError as e:
+                    logging.warning(f"Failed to write AAS file: {e}")
+            time_str = evt.expiry_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            logging.info("LOT file: port=%04X lot=%s name=%s size=%s mime=%s expiry=%s",
+                         evt.component.data.port, evt.lot, evt.name, len(evt.data), evt.mime.name, time_str)
+        elif evt_type == nrsc5.EventType.LOT_HEADER:
+            time_str = evt.expiry_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            logging.debug("LOT header: port=%04X lot=%s name=%s size=%s mime=%s expiry=%s",
+                          evt.component.data.port, evt.lot, evt.name, evt.size, evt.mime.name, time_str)
+        elif evt_type == nrsc5.EventType.LOT_FRAGMENT:
+            if not evt.is_duplicate:
+                logging.debug("LOT fragment: port=%04X lot=%d seq=%d repeat=%d size=%d bytes_so_far=%d",
+                              evt.component.data.port, evt.lot, evt.seq, evt.repeat, len(evt.data), evt.bytes_so_far)
+        elif evt_type == nrsc5.EventType.STATION_ID:
+            logging.info("Country: %s, FCC facility ID: %s", evt.country_code, evt.fcc_facility_id)
+        elif evt_type == nrsc5.EventType.STATION_NAME:
+            logging.info("Station name: %s", evt.name)
+        elif evt_type == nrsc5.EventType.STATION_SLOGAN:
+            logging.info("Slogan: %s", evt.slogan)
+        elif evt_type == nrsc5.EventType.STATION_MESSAGE:
+            logging.info("Message: %s", evt.message)
+        elif evt_type == nrsc5.EventType.STATION_LOCATION:
+            logging.info("Station location: %.4f, %.4f, %dm", evt.latitude, evt.longitude, evt.altitude)
+        elif evt_type == nrsc5.EventType.AUDIO_SERVICE_DESCRIPTOR:
+            logging.info("Audio program %s: %s, type: %s, sound experience %s",
+                         evt.program,
+                         evt.access.name,
+                         self.radio.program_type_name(evt.type),
+                         evt.sound_exp)
+        elif evt_type == nrsc5.EventType.DATA_SERVICE_DESCRIPTOR:
+            logging.info("Data service: %s, type: %s, MIME type %03x",
+                         evt.access.name,
+                         self.radio.service_data_type_name(evt.type),
+                         evt.mime_type)
+        elif evt_type == nrsc5.EventType.EMERGENCY_ALERT:
+            if evt.message is not None:
+                categories = ", ".join(self.radio.alert_category_name(category) for category in evt.categories)
+                logging.info("Alert: Category=[%s] %s=%s %s", categories, evt.location_format.name, str(evt.locations), evt.message)
+            else:
+                logging.info("Alert ended")
+        elif evt_type == nrsc5.EventType.AUDIO_SERVICE:
+            logging.info("Audio service %s: %s, type: %s, codec: %d, blend: %s, gain: %d dB, delay: %d, latency: %d",
+                         evt.program,
+                         evt.access.name,
+                         self.radio.program_type_name(evt.type),
+                         evt.codec_mode,
+                         evt.blend_control.name,
+                         evt.digital_audio_gain,
+                         evt.common_delay,
+                         evt.latency)
+        elif evt_type == nrsc5.EventType.HERE_IMAGE:
+            if self.args.dump_aas_files:
+                time_int = int(evt.time_utc.timestamp())
+                path = os.path.join(self.args.dump_aas_files, f"{time_int}_{evt.name}")
+                try:
+                    with open(path, "wb") as file:
+                        file.write(evt.data)
+                except OSError as e:
+                    logging.warning(f"Failed to write HERE image: {e}")
+            time_str = evt.time_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            logging.info("HERE Image: type=%s, seq=%d, n1=%d, n2=%d, time=%s, lat1=%.5f, lon1=%.5f, lat2=%.5f, lon2=%.5f, name=%s, size=%d",
+                         evt.image_type.name, evt.seq, evt.n1, evt.n2, time_str, evt.latitude1, evt.longitude1,
+                         evt.latitude2, evt.longitude2, evt.name, len(evt.data))
 
 
 if __name__ == "__main__":

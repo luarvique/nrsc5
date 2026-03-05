@@ -69,6 +69,12 @@ static uint8_t gray8(float f)
         return 1;
 }
 
+static inline int8_t demod(float x, float mult)
+{
+    float clamped = fmaxf(fminf(x, 1), -1);
+    return lroundf(clamped * mult);
+}
+
 static uint8_t qpsk(complex float cf)
 {
     return (crealf(cf) < 0 ? 0 : 1) | (cimagf(cf) < 0 ? 0 : 2);
@@ -89,9 +95,10 @@ static void adjust_ref(sync_t *st, unsigned int ref, int cfo)
     unsigned int n;
     float cfo_freq = 2 * M_PI * cfo * CP_FM / FFT_FM;
 
-    // sync bits (after DBPSK)
+    // differentially-encoded sync & parity bits
     static const signed char sync[] = {
-        -1, 1, -1, -1, -1, 1, 1
+        -1, 1, -1, -1, -1, 1, 1, 0, 1, -1, 0, 0, 0, -1, -1, 0,
+        0, 0, 0, 0, -1, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, -1
     };
 
     for (n = 0; n < BLKSZ; n++)
@@ -109,9 +116,9 @@ static void adjust_ref(sync_t *st, unsigned int ref, int cfo)
         if (st->costas_phase[ref] < -M_PI) st->costas_phase[ref] += 2 * M_PI;
     }
 
-    // compare to sync bits
+    // compare to sync & parity bits
     float x = 0;
-    for (n = 0; n < sizeof(sync); n++)
+    for (n = 0; n < BLKSZ; n++)
         x += crealf(st->buffer[ref][n]) * sync[n];
     if (x < 0)
     {
@@ -150,8 +157,6 @@ static int fuzzy_match(const signed char *needle, unsigned int needle_size, cons
         unsigned int i;
         for (i = 0; i < needle_size; i++)
         {
-            // first bit of data may be wrong, so ignore
-            if ((n + i) % size == 0) continue;
             // ignore don't care bits
             if (needle[i] < 0) continue;
             // test if bit is correct
@@ -164,29 +169,43 @@ static int fuzzy_match(const signed char *needle, unsigned int needle_size, cons
     return -1;
 }
 
-static int find_first_block(sync_t *st, unsigned int ref, unsigned int rsid)
+static int decode_ref_fm(sync_t *st, unsigned int ref, unsigned int rsid, unsigned int *bc, unsigned int *psmi)
 {
     signed char needle[] = {
-        0, 1, 1, 0, 0, 1, 0, -1, -1, 1, rsid >> 1, rsid & 1, 0, (rsid >> 1) ^ (rsid & 1), 0, -1, 0, 0, 0, 0, -1, 1, 1, 1
+        0, 1, 0, 0, 0, 1, 1, -1, 1, 0, rsid >> 1, (rsid >> 1) ^ (rsid & 1), -1, 0, 0, -1,
+        -1, -1, -1, -1, 0, 1, 0, -1, -1, -1, -1, -1, -1, -1, -1, 0
     };
     unsigned char data[BLKSZ];
-    int n;
+
+    for (int n = 0; n < BLKSZ; n++)
+        if (needle[n] >= 0)
+            if (needle[n] != (crealf(st->buffer[ref][n]) > 0))
+                return -1;
 
     decode_dbpsk(st->buffer[ref], data, BLKSZ);
-    n = fuzzy_match(needle, sizeof(needle), data, BLKSZ);
-    if (n == 0)
-        st->psmi = (data[25] << 5) | (data[26] << 4) | (data[27] << 3) | (data[28] << 2) | (data[29] << 1) | data[30];
-    return n;
+    *bc = (data[16] << 3) | (data[17] << 2) | (data[18] << 1) | data[19];
+    *psmi = (data[25] << 5) | (data[26] << 4) | (data[27] << 3) | (data[28] << 2) | (data[29] << 1) | data[30];
+    return 0;    
 }
 
-static int find_ref(sync_t *st, unsigned int ref, unsigned int rsid)
+static int find_ref_fm(sync_t *st, unsigned int ref, unsigned int rsid)
 {
     signed char needle[] = {
-        0, 1, 1, 0, 0, 1, 0, -1, -1, 1, rsid >> 1, rsid & 1, 0, (rsid >> 1) ^ (rsid & 1), 0, -1, -1, -1, -1, -1, -1, 1, 1, 1
+        0, 1, 0, 0, 0, 1, 1, -1, 1, 0, rsid >> 1, (rsid >> 1) ^ (rsid & 1), -1, 0, 0, -1,
+        -1, -1, -1, -1, 0, 1, 0, -1, -1, -1, -1, -1, -1, -1, -1, 0
     };
     unsigned char data[BLKSZ];
 
-    decode_dbpsk(st->buffer[ref], data, BLKSZ);
+    for (int n = 0; n < BLKSZ; n++)
+        data[n] = crealf(st->buffer[ref][n]) <= 0 ? 0 : 1;
+
+    int match = fuzzy_match(needle, sizeof(needle), data, BLKSZ);
+    if (match >= 0)
+        return match;
+
+    for (int n = 0; n < BLKSZ; n++)
+        data[n] ^= 1;
+
     return fuzzy_match(needle, sizeof(needle), data, BLKSZ);
 }
 
@@ -281,13 +300,13 @@ void detect_cfo(sync_t *st)
         for (int i = 0; i <= PM_PARTITIONS; i++)
         {
             adjust_ref(st, cfo + LB_START + i * PARTITION_WIDTH, cfo);
-            offset = find_ref(st, cfo + LB_START + i * PARTITION_WIDTH, (MIDDLE_REF_SC-i) & 0x3);
+            offset = find_ref_fm(st, cfo + LB_START + i * PARTITION_WIDTH, (MIDDLE_REF_SC-i) & 0x3);
             reset_ref(st, cfo + LB_START + i * PARTITION_WIDTH);
             if (offset >= 0)
                 offset_count[offset]++;
 
             adjust_ref(st, cfo + UB_END - i * PARTITION_WIDTH, cfo);
-            offset = find_ref(st, cfo + UB_END - i * PARTITION_WIDTH, (MIDDLE_REF_SC-i) & 0x3);
+            offset = find_ref_fm(st, cfo + UB_END - i * PARTITION_WIDTH, (MIDDLE_REF_SC-i) & 0x3);
             reset_ref(st, cfo + UB_END - i * PARTITION_WIDTH);
             if (offset >= 0)
                 offset_count[offset]++;
@@ -304,10 +323,8 @@ void detect_cfo(sync_t *st)
         if (best_offset >= 0 && best_count >= 3)
         {
             // At least three offsets matched, so this is likely the correct CFO.
-            input_set_skip(st->input, best_offset * FFTCP_FM);
+            acquire_keep_extra(&st->input->acq, ((BLKSZ - best_offset) % BLKSZ) * FFTCP_FM);
             acquire_cfo_adjust(&st->input->acq, cfo);
-
-            log_debug("Block @ %d", best_offset);
 
             // Wait until the buffers have cleared before measuring again.
             st->cfo_wait = 8;
@@ -346,19 +363,50 @@ void sync_process_fm(sync_t *st)
     if (st->input->sync_state == SYNC_STATE_COARSE)
     {
         unsigned int good_refs = 0;
+        unsigned int seen_bc[16] = {0};
+        unsigned int seen_psmi[64] = {0};
         for (i = 0; i <= partitions_per_band; i++)
         {
-            if (find_first_block(st, LB_START + i * PARTITION_WIDTH, (MIDDLE_REF_SC-i) & 0x3) == 0)
+            unsigned int bc, psmi;
+            if (decode_ref_fm(st, LB_START + i * PARTITION_WIDTH, (MIDDLE_REF_SC-i) & 0x3, &bc, &psmi) == 0)
+            {
                 good_refs++;
-            if (find_first_block(st, UB_END - i * PARTITION_WIDTH, (MIDDLE_REF_SC-i) & 0x3) == 0)
+                seen_bc[bc]++;
+                seen_psmi[psmi]++;
+            }
+            if (decode_ref_fm(st, UB_END - i * PARTITION_WIDTH, (MIDDLE_REF_SC-i) & 0x3, &bc, &psmi) == 0)
+            {
                 good_refs++;
+                seen_bc[bc]++;
+                seen_psmi[psmi]++;
+            }
         }
 
         if (good_refs >= 4)
         {
-            input_set_sync_state(st->input, SYNC_STATE_FINE);
-            decode_reset(&st->input->decode);
-            frame_reset(&st->input->frame);
+            int majority_bc = -1;
+            for (unsigned int bc = 0; bc < 16; bc++)
+                if (seen_bc[bc] > good_refs / 2)
+                    majority_bc = bc;
+
+            int majority_psmi = -1;
+            for (unsigned int psmi = 0; psmi < 16; psmi++)
+                if (seen_psmi[psmi] > good_refs / 2)
+                    majority_psmi = psmi;
+
+            if ((majority_bc >= 0) && (majority_psmi >= 0))
+            {
+                st->bc = majority_bc;
+                st->psmi = majority_psmi;
+
+                input_set_sync_state(st->input, SYNC_STATE_FINE);
+
+                decode_reset(&st->input->decode);
+                decode_set_px1_length(&st->input->decode,
+                    (compatibility_mode[st->psmi] == 2) ? P3_FRAME_LEN_FM : P3_FRAME_LEN_FM * 2);
+
+                frame_reset(&st->input->frame);
+            }
         }
         else if (st->cfo_wait == 0)
         {
@@ -407,6 +455,11 @@ void sync_process_fm(sync_t *st)
 
         angle /= (partitions_per_band + 1) * 2;
         st->angle = angle;
+        for (i = 0; i < partitions_per_band * PARTITION_WIDTH + 1; i += PARTITION_WIDTH)
+        {
+            st->costas_freq[LB_START + i] -= angle;
+            st->costas_freq[UB_END - i] -= angle;
+        }
 
         // Calculate modulation error
         float error_lb = 0, error_ub = 0;
@@ -452,7 +505,8 @@ void sync_process_fm(sync_t *st)
         float mult_lb = fmaxf(fminf(mer_lb * 10, 127), 1);
         float mult_ub = fmaxf(fminf(mer_ub * 10, 127), 1);
 
-#define DEMOD(x) ((x) >= 0 ? 1 : -1)
+        decode_set_block(&st->input->decode, st->bc);
+
         for (int n = 0; n < BLKSZ; n++)
         {
             float complex c;
@@ -462,8 +516,8 @@ void sync_process_fm(sync_t *st)
                 for (j = 1; j < PARTITION_WIDTH; j++)
                 {
                     c = st->buffer[i + j][n];
-                    decode_push_pm(&st->input->decode, DEMOD(crealf(c)) * mult_lb);
-                    decode_push_pm(&st->input->decode, DEMOD(cimagf(c)) * mult_lb);
+                    decode_push_pm(&st->input->decode, demod(crealf(c), mult_lb));
+                    decode_push_pm(&st->input->decode, demod(cimagf(c), mult_lb));
                 }
             }
             for (i = UB_END - (PM_PARTITIONS * PARTITION_WIDTH); i < UB_END; i += PARTITION_WIDTH)
@@ -472,8 +526,8 @@ void sync_process_fm(sync_t *st)
                 for (j = 1; j < PARTITION_WIDTH; j++)
                 {
                     c = st->buffer[i + j][n];
-                    decode_push_pm(&st->input->decode, DEMOD(crealf(c)) * mult_ub);
-                    decode_push_pm(&st->input->decode, DEMOD(cimagf(c)) * mult_ub);
+                    decode_push_pm(&st->input->decode, demod(crealf(c), mult_ub));
+                    decode_push_pm(&st->input->decode, demod(cimagf(c), mult_ub));
                 }
             }
             if (compatibility_mode[st->psmi] == 2) {
@@ -481,14 +535,14 @@ void sync_process_fm(sync_t *st)
                 for (j = 1; j < PARTITION_WIDTH; j++)
                 {
                     c = st->buffer[LB_START + (PM_PARTITIONS * PARTITION_WIDTH) + j][n];
-                    decode_push_px1(&st->input->decode, DEMOD(crealf(c)) * mult_lb, P3_FRAME_LEN_FM / 2);
-                    decode_push_px1(&st->input->decode, DEMOD(cimagf(c)) * mult_lb, P3_FRAME_LEN_FM / 2);
+                    decode_push_px1(&st->input->decode, demod(crealf(c), mult_lb));
+                    decode_push_px1(&st->input->decode, demod(cimagf(c), mult_lb));
                 }
                 for (j = 1; j < PARTITION_WIDTH; j++)
                 {
                     c = st->buffer[UB_END - (PM_PARTITIONS + 1) * PARTITION_WIDTH + j][n];
-                    decode_push_px1(&st->input->decode, DEMOD(crealf(c)) * mult_ub, P3_FRAME_LEN_FM / 2);
-                    decode_push_px1(&st->input->decode, DEMOD(cimagf(c)) * mult_ub, P3_FRAME_LEN_FM / 2);
+                    decode_push_px1(&st->input->decode, demod(crealf(c), mult_ub));
+                    decode_push_px1(&st->input->decode, demod(cimagf(c), mult_ub));
                 }
             }
             if ((compatibility_mode[st->psmi] == 3) || (compatibility_mode[st->psmi] == 11)) {
@@ -498,8 +552,8 @@ void sync_process_fm(sync_t *st)
                     for (j = 1; j < PARTITION_WIDTH; j++)
                     {
                         c = st->buffer[i + j][n];
-                        decode_push_px1(&st->input->decode, DEMOD(crealf(c)) * mult_lb, P3_FRAME_LEN_FM);
-                        decode_push_px1(&st->input->decode, DEMOD(cimagf(c)) * mult_lb, P3_FRAME_LEN_FM);
+                        decode_push_px1(&st->input->decode, demod(crealf(c), mult_lb));
+                        decode_push_px1(&st->input->decode, demod(cimagf(c), mult_lb));
                     }
                 }
                 for (i = UB_END - (PM_PARTITIONS + 2) * PARTITION_WIDTH; i < UB_END - (PM_PARTITIONS * PARTITION_WIDTH); i += PARTITION_WIDTH)
@@ -508,8 +562,8 @@ void sync_process_fm(sync_t *st)
                     for (j = 1; j < PARTITION_WIDTH; j++)
                     {
                         c = st->buffer[i + j][n];
-                        decode_push_px1(&st->input->decode, DEMOD(crealf(c)) * mult_ub, P3_FRAME_LEN_FM);
-                        decode_push_px1(&st->input->decode, DEMOD(cimagf(c)) * mult_ub, P3_FRAME_LEN_FM);
+                        decode_push_px1(&st->input->decode, demod(crealf(c), mult_ub));
+                        decode_push_px1(&st->input->decode, demod(cimagf(c), mult_ub));
                     }
                 }
             }
@@ -520,8 +574,8 @@ void sync_process_fm(sync_t *st)
                     for (j = 1; j < PARTITION_WIDTH; j++)
                     {
                         c = st->buffer[i + j][n];
-                        decode_push_px2(&st->input->decode, DEMOD(crealf(c)) * mult_lb);
-                        decode_push_px2(&st->input->decode, DEMOD(cimagf(c)) * mult_lb);
+                        decode_push_px2(&st->input->decode, demod(crealf(c), mult_lb));
+                        decode_push_px2(&st->input->decode, demod(cimagf(c), mult_lb));
                     }
                 }
                 for (i = UB_END - (PM_PARTITIONS + 4) * PARTITION_WIDTH; i < UB_END - (PM_PARTITIONS + 2) * PARTITION_WIDTH; i += PARTITION_WIDTH)
@@ -530,12 +584,14 @@ void sync_process_fm(sync_t *st)
                     for (j = 1; j < PARTITION_WIDTH; j++)
                     {
                         c = st->buffer[i + j][n];
-                        decode_push_px2(&st->input->decode, DEMOD(crealf(c)) * mult_ub);
-                        decode_push_px2(&st->input->decode, DEMOD(cimagf(c)) * mult_ub);
+                        decode_push_px2(&st->input->decode, demod(crealf(c), mult_ub));
+                        decode_push_px2(&st->input->decode, demod(cimagf(c), mult_ub));
                     }
                 }
             }
         }
+
+        st->bc = (st->bc + 1) % 16;
     }
 }
 
@@ -567,8 +623,7 @@ void sync_process_am(sync_t *st)
         offset = find_ref_am(st, CENTER_AM + REF_INDEX_AM);
         if (offset > 0)
         {
-            input_set_skip(st->input, offset * FFTCP_AM);
-            log_debug("Block @ %d", offset);
+            acquire_keep_extra(&st->input->acq, ((BLKSZ - offset) % BLKSZ) * FFTCP_AM);
             st->cfo_wait = 8;
         }
     }
@@ -588,8 +643,8 @@ void sync_process_am(sync_t *st)
 
         if ((st->offset_history & 0xffff) == 0x5670)
         {
-            log_debug("Sync!");
-            st->input->sync_state = SYNC_STATE_FINE;
+            st->bc = 0;
+            input_set_sync_state(st->input, SYNC_STATE_FINE);
             decode_reset(&st->input->decode);
             frame_reset(&st->input->frame);
             st->offset_history = 0;
@@ -684,6 +739,8 @@ void sync_process_am(sync_t *st)
                 }
             }
         }
+
+        st->bc = (st->bc + 1) % 8;
     }
 }
 

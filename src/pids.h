@@ -15,6 +15,8 @@
 #define MAX_SLOGAN_FRAMES 16
 #define MAX_ALERT_LEN 381
 #define MAX_ALERT_FRAMES 64
+#define MAX_ALERT_CNT_LEN 63
+#define MAX_ALERT_LOCATIONS 31
 
 typedef struct
 {
@@ -87,8 +89,10 @@ typedef struct
     int alert_seq;
     encoding_t alert_encoding;
     int alert_len;
+    int alert_crc;
     int alert_cnt_len;
     int alert_displayed;
+    int alert_timeout;
 } pids_t;
 
 void pids_frame_push(pids_t *st, uint8_t *bits);

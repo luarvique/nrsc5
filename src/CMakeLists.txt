@@ -3,7 +3,6 @@ add_compile_options (--std=gnu11 -O3 -Wall -Wextra)
 add_definitions (-D_GNU_SOURCE)
 set (THREAD_LIBRARY pthread)
 if (CMAKE_SYSTEM_NAME MATCHES Linux)
-    check_library_exists (${THREAD_LIBRARY} pthread_setname_np "" HAVE_PTHREAD_SETNAME_NP)
     set (EXPORTS_LINKER_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libnrsc5.map")
 elseif (CMAKE_SYSTEM_NAME MATCHES Darwin)
     set (CMAKE_MACOSX_RPATH ON)
@@ -33,11 +32,11 @@ link_directories (
     ${LIBUSB_LIBRARY_DIRS}
 )
 
-add_library (
-    nrsc5_object OBJECT
+set (LIBRARY_FILES
     acquire.c
     decode.c
     frame.c
+    here_images.c
     input.c
     nrsc5.c
     output.c
@@ -52,15 +51,10 @@ add_library (
     rs_init.c
     rs_decode.c
 
-    log.c
     unicode.c
 
     strndup.c
 )
-set_property(TARGET nrsc5_object PROPERTY POSITION_INDEPENDENT_CODE ON)
-if (BUILTIN_LIBRARIES)
-    add_dependencies(nrsc5_object ${BUILTIN_LIBRARIES})
-endif ()
 
 set (
     LibraryDependencies
@@ -74,41 +68,54 @@ set (
 
 add_library (
     nrsc5 SHARED
-    $<TARGET_OBJECTS:nrsc5_object>
+    ${LIBRARY_FILES}
 )
 target_link_libraries (
     nrsc5
     ${LibraryDependencies}
 )
+if (BUILTIN_LIBRARIES)
+    add_dependencies(nrsc5 ${BUILTIN_LIBRARIES})
+endif ()
 set_target_properties(nrsc5 PROPERTIES PUBLIC_HEADER "../include/nrsc5.h")
 set_target_properties(nrsc5 PROPERTIES LINK_FLAGS "${STATIC_LINKER_FLAGS} ${EXPORTS_LINKER_FLAGS}")
 target_compile_definitions(nrsc5 PUBLIC "-DNRSC5_EXPORTS=1")
 
 add_library (
     nrsc5_static
-    $<TARGET_OBJECTS:nrsc5_object>
+    ${LIBRARY_FILES}
 )
 target_link_libraries (
     nrsc5_static
     ${LibraryDependencies}
 )
+if (BUILTIN_LIBRARIES)
+    add_dependencies(nrsc5_static ${BUILTIN_LIBRARIES})
+endif ()
 
-add_executable (
-    app
-    main.c
-)
-set_property (TARGET app PROPERTY OUTPUT_NAME nrsc5)
-set_target_properties(app PROPERTIES LINK_FLAGS "${STATIC_LINKER_FLAGS}")
-target_link_libraries (
-    app
-    nrsc5_static
-    ${AO_LIBRARIES}
-    ${THREAD_LIBRARY}
-    ${SOCKET_LIBRARY}
-)
+if (BUILD_CLI)
+    add_executable (
+        app
+        main.c
+        log.c
+    )
+    set_property (TARGET app PROPERTY OUTPUT_NAME nrsc5)
+    set_target_properties(app PROPERTIES LINK_FLAGS "${STATIC_LINKER_FLAGS}")
+    target_link_libraries (
+        app
+        nrsc5_static
+        ${AO_LIBRARIES}
+        ${THREAD_LIBRARY}
+        ${SOCKET_LIBRARY}
+    )
+    install (
+            TARGETS app
+            RUNTIME DESTINATION bin
+    )
+endif ()
 
 install (
-    TARGETS app nrsc5 nrsc5_static
+    TARGETS nrsc5 nrsc5_static
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib

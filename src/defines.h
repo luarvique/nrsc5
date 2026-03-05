@@ -19,7 +19,7 @@
 // OFDM symbols per L1 block
 #define BLKSZ 32
 // symbols processed by each invocation of acquire_process
-#define ACQUIRE_SYMBOLS (BLKSZ * 2)
+#define ACQUIRE_SYMBOLS (BLKSZ)
 // index of first lower sideband subcarrier
 #define LB_START ((FFT_FM / 2) - 546)
 // index of last upper sideband subcarrier
@@ -65,7 +65,9 @@
 // number of programs (max)
 #define MAX_PROGRAMS 8
 // number of streams per program (max)
-#define MAX_STREAMS 4
+#define MAX_STREAMS 2
+// number of audio packets in the elastic buffer
+#define ELASTIC_BUFFER_LEN 64
 // number of subcarriers per AM partition
 #define PARTITION_WIDTH_AM 25
 
@@ -91,14 +93,6 @@ typedef enum {
     P4_LOGICAL_CHANNEL,
     NUM_LOGICAL_CHANNELS
 } logical_channel_t;
-
-static inline cint16_t cf_to_cq15(float complex x)
-{
-    cint16_t cq15;
-    cq15.r = crealf(x) * 32767.0f;
-    cq15.i = cimagf(x) * 32767.0f;
-    return cq15;
-}
 
 static inline float complex cq15_to_cf(cint16_t cq15)
 {

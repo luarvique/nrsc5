@@ -31,6 +31,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <fcntl.h>
 #else
 #include <netdb.h>
 #include <sys/socket.h>
@@ -41,7 +42,7 @@
 #include "log.h"
 
 #define AUDIO_BUFFERS 128
-#define AUDIO_THRESHOLD 40
+#define AUDIO_THRESHOLD 8
 #define AUDIO_DATA_LENGTH 8192
 
 typedef struct buffer_t {
@@ -71,8 +72,10 @@ typedef struct {
 
     unsigned int program;
     unsigned int audio_ready;
+    unsigned int audio_packets_valid;
     unsigned int audio_packets;
     unsigned int audio_bytes;
+    unsigned int audio_errors;
     int done;
 } state_t;
 
@@ -84,7 +87,7 @@ static ao_sample_format sample_format = {
     "L,R"
 };
 
-static ao_device *open_ao_live()
+static ao_device *open_ao_live(void)
 {
     return ao_open_live(ao_default_driver_id(), &sample_format, NULL);
 }
@@ -226,17 +229,46 @@ static void dump_aas_file(state_t *st, const nrsc5_event_t *evt)
 #else
 #define PATH_SEPARATOR "/"
 #endif
-    char fullpath[strlen(st->aas_files_path) + strlen(evt->lot.name) + 16];
+
+    const char *name;
+    const uint8_t *data;
+    unsigned int size;
+    unsigned int number;
+
+    switch (evt->event)
+    {
+    case NRSC5_EVENT_LOT:
+        name = evt->lot.name;
+        data = evt->lot.data;
+        size = evt->lot.size;
+        number = evt->lot.lot;
+        break;
+    case NRSC5_EVENT_HERE_IMAGE:
+        name = evt->here_image.name;
+        data = evt->here_image.data;
+        size = evt->here_image.size;
+#if defined(WIN32) || defined(_WIN32)
+        number = _mkgmtime64(evt->here_image.time_utc);
+#else
+        number = timegm(evt->here_image.time_utc);
+#endif
+        break;
+    default:
+        log_error("invalid event type");
+        return;
+    }
+
+    char fullpath[strlen(st->aas_files_path) + strlen(name) + 16];
     FILE *fp;
 
-    sprintf(fullpath, "%s" PATH_SEPARATOR "%d_%s", st->aas_files_path, evt->lot.lot, evt->lot.name);
+    sprintf(fullpath, "%s" PATH_SEPARATOR "%u_%s", st->aas_files_path, number, name);
     fp = fopen(fullpath, "wb");
     if (fp == NULL)
     {
         log_warn("Failed to open %s (%d)", fullpath, errno);
         return;
     }
-    fwrite(evt->lot.data, 1, evt->lot.size, fp);
+    fwrite(data, 1, size, fp);
     fclose(fp);
 }
 
@@ -281,13 +313,20 @@ static void callback(const nrsc5_event_t *evt, void *opaque)
     state_t *st = opaque;
     nrsc5_sig_service_t *sig_service;
     nrsc5_sig_component_t *sig_component;
-    nrsc5_sis_asd_t *audio_service;
-    nrsc5_sis_dsd_t *data_service;
+    nrsc5_id3_comment_t *comment;
+    const char *name;
+    char time_str[64];
 
     switch (evt->event)
     {
     case NRSC5_EVENT_LOST_DEVICE:
         done_signal(st);
+        break;
+    case NRSC5_EVENT_AGC:
+        if (evt->agc.is_final)
+            log_info("Best gain: %.1f dB, Peak amplitude: %.1f dBFS", evt->agc.gain_db, evt->agc.peak_dbfs);
+        else
+            log_debug("Gain: %.1f dB, Peak amplitude: %.1f dBFS", evt->agc.gain_db, evt->agc.peak_dbfs);
         break;
     case NRSC5_EVENT_BER:
         dump_ber(evt->ber.cber);
@@ -307,10 +346,22 @@ static void callback(const nrsc5_event_t *evt, void *opaque)
 
             st->audio_packets++;
             st->audio_bytes += evt->hdc.count * sizeof(evt->hdc.data[0]);
-            if (st->audio_packets >= 32) {
-                log_info("Audio bit rate: %.1f kbps", (float)st->audio_bytes * 8 * NRSC5_SAMPLE_RATE_AUDIO / NRSC5_AUDIO_FRAME_SAMPLES / st->audio_packets / 1000);
-                st->audio_packets = 0;
+            if (evt->hdc.flags & NRSC5_PKT_FLAGS_CRC_ERROR)
+                st->audio_errors++;
+            else
+                st->audio_packets_valid++;
+
+            if (st->audio_packets_valid >= 32) {
+                log_info("Audio bit rate: %.1f kbps", (float)st->audio_bytes * 8 * NRSC5_SAMPLE_RATE_AUDIO / NRSC5_AUDIO_FRAME_SAMPLES / st->audio_packets_valid / 1000);
+                st->audio_packets_valid = 0;
                 st->audio_bytes = 0;
+            }
+            if (st->audio_packets >= 32)
+            {
+                if (st->audio_errors > 0)
+                    log_warn("Audio packet CRC mismatches: %d", st->audio_errors);
+                st->audio_packets = 0;
+                st->audio_errors = 0;
             }
         }
         break;
@@ -319,6 +370,8 @@ static void callback(const nrsc5_event_t *evt, void *opaque)
         break;
     case NRSC5_EVENT_SYNC:
         log_info("Synchronized");
+        log_info("Frequency offset: %.0f Hz", evt->sync.freq_offset);
+        log_info("Primary service mode: %d", evt->sync.psmi);
         st->audio_ready = 0;
         break;
     case NRSC5_EVENT_LOST_SYNC:
@@ -335,6 +388,8 @@ static void callback(const nrsc5_event_t *evt, void *opaque)
                 log_info("Album: %s", evt->id3.album);
             if (evt->id3.genre)
                 log_info("Genre: %s", evt->id3.genre);
+            for (comment = evt->id3.comments; comment != NULL; comment = comment->next)
+                log_info("Comment: lang=%s %s %s", comment->lang, comment->short_content_desc, comment->full_text);
             if (evt->id3.ufid.owner)
                 log_info("Unique file identifier: %s %s", evt->id3.ufid.owner, evt->id3.ufid.id);
             if (evt->id3.xhdr.param >= 0)
@@ -365,48 +420,132 @@ static void callback(const nrsc5_event_t *evt, void *opaque)
         }
         break;
     case NRSC5_EVENT_STREAM:
-        log_info("Stream data: port=%04X seq=%04X mime=%08X size=%d", evt->stream.port, evt->stream.seq, evt->stream.mime, evt->stream.size);
+        log_debug("Stream data: port=%04X seq=%04X mime=%08X size=%d", evt->stream.component->data.port, evt->stream.seq, evt->stream.component->data.mime, evt->stream.size);
         break;
     case NRSC5_EVENT_PACKET:
-        log_info("Packet data: port=%04X seq=%04X mime=%08X size=%d", evt->packet.port, evt->packet.seq, evt->packet.mime, evt->packet.size);
+        log_debug("Packet data: port=%04X seq=%04X mime=%08X size=%d", evt->packet.component->data.port, evt->packet.seq, evt->packet.component->data.mime, evt->packet.size);
         break;
     case NRSC5_EVENT_LOT:
         if (st->aas_files_path)
             dump_aas_file(st, evt);
-        char time_str[64];
         strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%SZ", evt->lot.expiry_utc);
-        log_info("LOT file: port=%04X lot=%d name=%s size=%d mime=%08X expiry=%s", evt->lot.port, evt->lot.lot, evt->lot.name, evt->lot.size, evt->lot.mime, time_str);
+        log_info("LOT file: port=%04X lot=%d name=%s size=%d mime=%08X expiry=%s", evt->lot.component->data.port, evt->lot.lot, evt->lot.name, evt->lot.size, evt->lot.mime, time_str);
         break;
-    case NRSC5_EVENT_SIS:
-        if (evt->sis.country_code)
-            log_info("Country: %s, FCC facility ID: %d", evt->sis.country_code, evt->sis.fcc_facility_id);
-        if (evt->sis.name)
-            log_info("Station name: %s", evt->sis.name);
-        if (evt->sis.slogan)
-            log_info("Slogan: %s", evt->sis.slogan);
-        if (evt->sis.message)
-            log_info("Message: %s", evt->sis.message);
-        if (evt->sis.alert)
-            log_info("Alert: %s", evt->sis.alert);
-        if (!isnan(evt->sis.latitude))
-            log_info("Station location: %.4f, %.4f, %dm", evt->sis.latitude, evt->sis.longitude, evt->sis.altitude);
-        for (audio_service = evt->sis.audio_services; audio_service != NULL; audio_service = audio_service->next)
+    case NRSC5_EVENT_LOT_HEADER:
+        strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%SZ", evt->lot.expiry_utc);
+        log_debug("LOT header: port=%04X lot=%d name=%s size=%d mime=%08X expiry=%s",
+                  evt->lot.component->data.port, evt->lot.lot, evt->lot.name, evt->lot.size, evt->lot.mime, time_str);
+        break;
+    case NRSC5_EVENT_LOT_FRAGMENT:
+        if (!evt->lot_fragment.is_duplicate)
+            log_debug("LOT fragment: port=%04X lot=%d seq=%d repeat=%d size=%d bytes_so_far=%d",
+                      evt->lot_fragment.component->data.port, evt->lot_fragment.lot, evt->lot_fragment.seq,
+                      evt->lot_fragment.repeat, evt->lot_fragment.size, evt->lot_fragment.bytes_so_far);
+        break;
+    case NRSC5_EVENT_STATION_ID:
+        log_info("Country: %s, FCC facility ID: %d", evt->station_id.country_code, evt->station_id.fcc_facility_id);
+        break;
+    case NRSC5_EVENT_STATION_NAME:
+        log_info("Station name: %s", evt->station_name.name);
+        break;
+    case NRSC5_EVENT_STATION_SLOGAN:
+        log_info("Slogan: %s", evt->station_slogan.slogan);
+        break;
+    case NRSC5_EVENT_STATION_MESSAGE:
+        log_info("Message: %s", evt->station_message.message);
+        break;
+    case NRSC5_EVENT_STATION_LOCATION:
+        log_info("Station location: %.4f, %.4f, %dm", evt->station_location.latitude, evt->station_location.longitude, evt->station_location.altitude);
+        break;
+    case NRSC5_EVENT_AUDIO_SERVICE_DESCRIPTOR:
+        nrsc5_program_type_name(evt->asd.type, &name);
+        log_info("Audio program %d: %s, type: %s, sound experience %d",
+                    evt->asd.program,
+                    evt->asd.access == NRSC5_ACCESS_PUBLIC ? "public" : "restricted",
+                    name, evt->asd.sound_exp);
+        break;
+    case NRSC5_EVENT_DATA_SERVICE_DESCRIPTOR:
+        nrsc5_service_data_type_name(evt->dsd.type, &name);
+        log_info("Data service: %s, type: %s, MIME type %03x",
+                    evt->dsd.access == NRSC5_ACCESS_PUBLIC ? "public" : "restricted",
+                    name, evt->dsd.mime_type);
+        break;
+    case NRSC5_EVENT_EMERGENCY_ALERT:
+        if (evt->emergency_alert.message)
         {
+            int i;
+            char alert_details[512] = "";
             const char *name = NULL;
-            nrsc5_program_type_name(audio_service->type, &name);
-            log_info("Audio program %d: %s, type: %s, sound experience %d",
-                     audio_service->program,
-                     audio_service->access == NRSC5_ACCESS_PUBLIC ? "public" : "restricted",
-                     name, audio_service->sound_exp);
+
+            strcat(alert_details, "Category=[");
+            if (evt->emergency_alert.category1 >= 1)
+            {
+                nrsc5_alert_category_name(evt->emergency_alert.category1, &name);
+                strcat(alert_details, name);
+            }
+            if (evt->emergency_alert.category2 >= 1)
+            {
+                nrsc5_alert_category_name(evt->emergency_alert.category2, &name);
+                strcat(alert_details, ", ");
+                strcat(alert_details, name);
+            }
+            strcat(alert_details, "] ");
+
+            switch (evt->emergency_alert.location_format)
+            {
+            case NRSC5_LOCATION_FORMAT_SAME:
+                strcat(alert_details, "SAME=");
+                break;
+            case NRSC5_LOCATION_FORMAT_FIPS:
+                strcat(alert_details, "FIPS=");
+                break;
+            case NRSC5_LOCATION_FORMAT_ZIP:
+                strcat(alert_details, "ZIP=");
+                break;
+            }
+
+            strcat(alert_details, "[");
+            for (i = 0; i < evt->emergency_alert.num_locations; i++)
+            {
+                if (i > 0)
+                    strcat(alert_details, ", ");
+                sprintf(alert_details + strlen(alert_details), "%d", evt->emergency_alert.locations[i]);
+            }
+            strcat(alert_details, "]");
+
+            log_info("Alert: %s %s", alert_details, evt->emergency_alert.message);
         }
-        for (data_service = evt->sis.data_services; data_service != NULL; data_service = data_service->next)
-        {
-            const char *name = NULL;
-            nrsc5_service_data_type_name(data_service->type, &name);
-            log_info("Data service: %s, type: %s, MIME type %03x",
-                     data_service->access == NRSC5_ACCESS_PUBLIC ? "public" : "restricted",
-                     name, data_service->mime_type);
-        }
+        else
+            log_info("Alert ended");
+        break;
+    case NRSC5_EVENT_AUDIO_SERVICE:
+        nrsc5_program_type_name(evt->audio_service.type, &name);
+        log_info("Audio service %d: %s, type: %s, codec: %d, blend: %d, gain: %d dB, delay: %d, latency: %d",
+                evt->audio_service.program,
+                evt->audio_service.access == NRSC5_ACCESS_PUBLIC ? "public" : "restricted",
+                name,
+                evt->audio_service.codec_mode,
+                evt->audio_service.blend_control,
+                evt->audio_service.digital_audio_gain,
+                evt->audio_service.common_delay,
+                evt->audio_service.latency);
+        break;
+    case NRSC5_EVENT_HERE_IMAGE:
+        if (st->aas_files_path)
+            dump_aas_file(st, evt);
+        strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%SZ", evt->here_image.time_utc);
+        log_info("HERE Image: type=%s, seq=%d, n1=%d, n2=%d, time=%s, lat1=%.5f, lon1=%.5f, lat2=%.5f, lon2=%.5f, name=%s, size=%d",
+                 evt->here_image.image_type == NRSC5_HERE_IMAGE_TRAFFIC ? "TRAFFIC" : "WEATHER",
+                 evt->here_image.seq,
+                 evt->here_image.n1,
+                 evt->here_image.n2,
+                 time_str,
+                 evt->here_image.latitude1,
+                 evt->here_image.longitude1,
+                 evt->here_image.latitude2,
+                 evt->here_image.longitude2,
+                 evt->here_image.name,
+                 evt->here_image.size);
         break;
     }
 }
@@ -468,7 +607,12 @@ static void *input_main(void *arg)
     if (!isatty(STDIN_FILENO))
         return NULL;
 
-#ifndef __MINGW32__
+#ifdef __MINGW32__
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    GetConsoleMode(hStdin, &mode);
+    SetConsoleMode(hStdin, mode & (~ENABLE_ECHO_INPUT) & (~ENABLE_LINE_INPUT));
+#else
     struct termios prev_termios, t;
 
     // disable terminal canonical mode
@@ -481,14 +625,9 @@ static void *input_main(void *arg)
 
     while (!st->done)
     {
-#ifdef __MINGW32__
-        int ch;
-        ch = _getch();
-#else
         char ch;
         if (read(STDIN_FILENO, &ch, 1) != 1)
             break;
-#endif
 
         switch (ch)
         {
@@ -542,6 +681,7 @@ static int parse_args(state_t *st, int argc, char *argv[])
     st->bias_tee = 0;
     st->direct_sampling = -1;
     st->ppm_error = INT_MIN;
+    log_set_level(LOG_INFO);
 
     while ((opt = getopt_long(argc, argv, "r:w:o:t:d:p:g:ql:vH:TD:", long_opts, NULL)) != -1)
     {
@@ -717,10 +857,6 @@ int main(int argc, char *argv[])
     nrsc5_t *radio = NULL;
     state_t *st = calloc(1, sizeof(state_t));
 
-#ifdef __MINGW32__
-    SetConsoleOutputCP(CP_UTF8);
-#endif
-
     pthread_mutex_init(&log_mutex, NULL);
     log_set_lock(log_lock);
     log_set_udata(&log_mutex);
@@ -729,6 +865,12 @@ int main(int argc, char *argv[])
     init_audio_buffers(st);
     if (parse_args(st, argc, argv) != 0)
         return 0;
+
+#ifdef __MINGW32__
+    SetConsoleOutputCP(CP_UTF8);
+    setmode(fileno(stdin), O_BINARY);
+    setmode(fileno(stdout), O_BINARY);
+#endif
 
     if (st->input_name)
     {

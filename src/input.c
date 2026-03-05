@@ -38,35 +38,6 @@ static float decim_taps[] = {
     -0.00410953676328063
 };
 
-static void input_push_to_acquire(input_t *st)
-{
-    if (st->skip)
-    {
-        if (st->skip > st->avail - st->used)
-        {
-            st->skip -= st->avail - st->used;
-            st->used = st->avail;
-        }
-        else
-        {
-            st->used += st->skip;
-            st->skip = 0;
-        }
-    }
-
-    st->used += acquire_push(&st->acq, &st->buffer[st->used], st->avail - st->used);
-}
-
-void input_pdu_push(input_t *st, uint8_t *pdu, unsigned int len, unsigned int program, unsigned int stream_id)
-{
-    output_push(st->output, pdu, len, program, stream_id);
-}
-
-void input_set_skip(input_t *st, unsigned int skip)
-{
-    st->skip += skip;
-}
-
 int input_shift(input_t *st, unsigned int cnt)
 {
     if (cnt + st->avail > INPUT_BUF_LEN)
@@ -97,7 +68,7 @@ void input_push(input_t *st)
 {
     while (st->avail - st->used >= (st->radio->mode == NRSC5_MODE_FM ? FFTCP_FM : FFTCP_AM))
     {
-        input_push_to_acquire(st);
+        st->used += acquire_push(&st->acq, &st->buffer[st->used], st->avail - st->used);
         acquire_process(&st->acq);
     }
 }
@@ -169,7 +140,6 @@ void input_reset(input_t *st)
 {
     st->avail = 0;
     st->used = 0;
-    st->skip = 0;
     st->offset = 0;
 
     input_set_sync_state(st, SYNC_STATE_NONE);
@@ -222,14 +192,11 @@ void input_set_sync_state(input_t *st, unsigned int new_state)
         nrsc5_report_lost_sync(st->radio);
     if (new_state == SYNC_STATE_FINE)
     {
-        nrsc5_report_sync(st->radio);
-        log_debug("Primary service mode: %d", st->sync.psmi);
+        float freq_offset = (st->acq.prev_angle - 2 * M_PI * st->acq.cfo)
+                          * (st->radio->mode == NRSC5_MODE_FM ? NRSC5_SAMPLE_RATE_CS16_FM : NRSC5_SAMPLE_RATE_CS16_AM)
+                          / (2 * M_PI * st->acq.fft);
+        nrsc5_report_sync(st->radio, freq_offset, st->sync.psmi);
     }
 
     st->sync_state = new_state;
-}
-
-void input_aas_push(input_t *st, uint8_t *psd, unsigned int len)
-{
-    output_aas_push(st->output, psd, len);
 }

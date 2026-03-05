@@ -1,6 +1,6 @@
 # nrsc5
 
-This program receives NRSC-5 digital radio stations using an RTL-SDR dongle. It offers a command-line interface as well as an API upon which other applications can be built. Before using it, you'll first need to compile the program using the build instructions below.
+This program receives NRSC-5 digital radio stations using an RTL-SDR dongle, or by reading from I/Q files. It offers a command-line interface as well as an API upon which other applications can be built. Before using it, you'll first need to compile the program using the build instructions below.
 
 ## Building on Ubuntu, Debian or Raspbian
 
@@ -59,7 +59,7 @@ If this is the first time running pacman, you will be told to close the terminal
     pacman -Su
     pacman -S git
     git clone https://github.com/theori-io/nrsc5.git
-    nrsc5/support/msys2-build
+    nrsc5/support/msys2-build -j4
 
 You can test your installation using the included sample file:
 
@@ -76,15 +76,19 @@ Once everything is built, you can run nrsc5 independently of MSYS2. Copy the fol
 
 ### Cross-compiling for Windows from Ubuntu / Debian
 
-    sudo apt install mingw-w64
-    support/win-cross-compile 64
+    sudo apt install cmake autoconf libtool pkgconf git mingw-w64
+    git clone https://github.com/theori-io/nrsc5.git
+    cd nrsc5
+    support/win-cross-compile 64 --cmake-args="-DUSE_SSE=ON" -j4
 
 Replace `64` with `32` if you want a 32-bit build. Once the build is complete, copy `*.dll` and `nrsc5.exe` from the `build-win64/bin` (or `build-win32/bin`) folder to your Windows machine.
 
 ### Cross-compiling for Windows from macOS
 
-    brew install mingw-w64
-    support/win-cross-compile 64
+    brew install cmake autoconf automake libtool pkgconf git mingw-w64
+    git clone https://github.com/theori-io/nrsc5.git
+    cd nrsc5
+    support/win-cross-compile 64 --cmake-args="-DUSE_SSE=ON" -j4
 
 Replace `64` with `32` if you want a 32-bit build. Once the build is complete, copy `*.dll` and `nrsc5.exe` from the `build-win64/bin` (or `build-win32/bin`) folder to your Windows machine.
 
@@ -148,3 +152,9 @@ To quit, press <kbd>Q</kbd>.
 ### RTL-SDR drivers on Windows
 
 If you get errors trying to access your RTL-SDR device, then you may need to use [Zadig](http://zadig.akeo.ie/) to change the USB driver. Once you download and run Zadig, select your RTL-SDR device, ensure the driver is set to WinUSB, and then click "Replace Driver". If your device is not listed, enable "Options" -> "List All Devices".
+
+### Application Programming Interface (API)
+
+If you would like to build an application that makes use of nrsc5's functionality, you can use the [C API](include/nrsc5.h) ([documentation](https://theori-io.github.io/nrsc5/c-api/)) or [Python API](support/nrsc5.py). The [`nrsc5` command-line application](src/main.c) is built on top of the C API, and an equivalent [Python command-line application](support/cli.py) is built on top of the Python API. These applications serve as examples of how to use the API.
+
+Note: When using the Python API or the Python command-line application on Windows, place `libnrsc5.dll` in the same folder as `nrsc5.py`.

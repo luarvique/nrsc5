@@ -19,6 +19,7 @@
 #include "frame.h"
 #include "input.h"
 #include "rs_char.h"
+#include "private.h"
 
 #define PCI_AUDIO 0x38D8D3
 #define PCI_AUDIO_OPP 0xCE3634
@@ -30,7 +31,7 @@
 
 typedef struct
 {
-    unsigned int codec;
+    unsigned int codec_mode;
     unsigned int stream_id;
     unsigned int pdu_seq;
     unsigned int blend_control;
@@ -172,9 +173,6 @@ static int fix_header(frame_t *st, uint8_t *buf)
         if (hdr[i] != 0)
             return 0;
 
-    if (corrections > 0)
-        log_debug("RS corrected %d symbols", corrections);
-
     for (i = 0; i < RS_CODEWORD_LEN; i++)
         buf[i] = hdr[RS_BLOCK_LEN-i-1];
     return 1;
@@ -182,7 +180,7 @@ static int fix_header(frame_t *st, uint8_t *buf)
 
 static void parse_header(uint8_t *buf, frame_header_t *hdr)
 {
-    hdr->codec = buf[8] & 0xf;
+    hdr->codec_mode = buf[8] & 0xf;
     hdr->stream_id = (buf[8] >> 4) & 0x3;
     hdr->pdu_seq = (buf[8] >> 6) | ((buf[9] & 1) << 2);
     hdr->blend_control = (buf[9] >> 1) & 0x3;
@@ -268,7 +266,7 @@ static unsigned int parse_hef(uint8_t *buf, unsigned int length, hef_t *hef)
 
 static unsigned int calc_lc_bits(frame_header_t *hdr)
 {
-    switch(hdr->codec)
+    switch(hdr->codec_mode)
     {
     case 0:
         return 16;
@@ -283,8 +281,34 @@ static unsigned int calc_lc_bits(frame_header_t *hdr)
     case 13:
         return 12;
     default:
-        log_warn("unknown codec field (%d)", hdr->codec);
+        log_warn("unknown codec field (%d)", hdr->codec_mode);
         return 16;
+    }
+}
+
+static unsigned int calc_avg_packets(frame_header_t *hdr)
+{
+    switch(hdr->codec_mode)
+    {
+        case 0:
+            return 32;
+        case 1:
+        case 2:
+        case 3:
+            if (hdr->stream_id == 0)
+                return 4;
+            else
+                return 32;
+        case 10:
+            if (hdr->stream_id == 0)
+                return 32;
+            else
+                return 4;
+        case 13:
+            return 4;
+        default:
+            log_warn("unknown codec field (%d)", hdr->codec_mode);
+            return 32;
     }
 }
 
@@ -328,7 +352,8 @@ static void aas_push(frame_t *st, uint8_t* psd, unsigned int length, logical_cha
     }
     else if (fcs16(psd, length) != VALIDFCS16)
     {
-        log_info("psd crc mismatch");
+        // occasional CRC errors are normal, because transmitters abandon their HDLC
+        // frame mid-stream when switching to new PSD data
     }
     else if (psd[0] != 0x21)
     {
@@ -337,7 +362,7 @@ static void aas_push(frame_t *st, uint8_t* psd, unsigned int length, logical_cha
     else
     {
         // remove protocol and fcs fields
-        input_aas_push(st->input, psd + 1, length - 3);
+        output_aas_push(st->input->output, psd + 1, length - 3);
     }
 }
 
@@ -394,7 +419,6 @@ static void process_fixed_ccc(frame_t *st, uint8_t *buf, unsigned int buflen, lo
         {
             uint16_t mode = buf[1 + i * 4] | (buf[2 + i * 4] << 8);
             uint16_t length = buf[3 + i * 4] | (buf[4 + i * 4] << 8);
-            log_info("Logical channel %d, Subchannel %d: mode=%d, length=%d", lc, i, mode, length);
 
             if (mode == 0)
             {
@@ -503,7 +527,7 @@ void frame_process(frame_t *st, size_t length, logical_channel_t lc)
     while (offset < audio_end - RS_CODEWORD_LEN)
     {
         unsigned int start = offset;
-        unsigned int j, lc_bits, loc_bytes, prog;
+        unsigned int j, lc_bits, loc_bytes, prog, avg, seq, output_offset;
         unsigned short locations[MAX_AUDIO_PACKETS];
         frame_header_t hdr = {0};
         hef_t hef = {0};
@@ -532,9 +556,57 @@ void frame_process(frame_t *st, size_t length, logical_channel_t lc)
         }
         offset += loc_bytes;
 
+        if (hdr.stream_id >= MAX_STREAMS)
+        {
+            log_warn("invalid stream_id: %d", hdr.stream_id);
+            offset = start + locations[hdr.nop - 1] + 1;
+            continue;
+        }
+
         if (hdr.hef)
             offset += parse_hef(st->buffer + offset, audio_end - offset, &hef);
         prog = hef.prog_num;
+        audio_service_t *service = &st->services[prog];
+
+        if ((hdr.stream_id == 0) && (
+            (service->access != (int) hef.access) ||
+            (service->type != (int) hef.prog_type) ||
+            (service->codec_mode != (int) hdr.codec_mode) ||
+            (service->blend_control != (int) hdr.blend_control) ||
+            (service->digital_audio_gain != (int) hdr.per_stream_delay) ||
+            (service->common_delay != (int) hdr.common_delay) ||
+            (service->latency != (int) hdr.latency)
+        ))
+        {
+            service->access = hef.access;
+            service->type = hef.prog_type;
+            service->codec_mode = hdr.codec_mode;
+            service->blend_control = hdr.blend_control;
+            service->digital_audio_gain = hdr.per_stream_delay;
+            service->common_delay = hdr.common_delay;
+            service->latency = hdr.latency;
+
+            nrsc5_report_audio_service(
+                st->input->radio,
+                prog,
+                service->access,
+                service->type,
+                service->codec_mode,
+                service->blend_control,
+                (service->digital_audio_gain < 16) ? service->digital_audio_gain : (service->digital_audio_gain - 32),
+                service->common_delay * 4,
+                service->latency * 2
+            );
+        }
+
+        avg = calc_avg_packets(&hdr);
+        seq = (ELASTIC_BUFFER_LEN + hdr.seq - hdr.pfirst) % ELASTIC_BUFFER_LEN;
+
+        output_offset = (ELASTIC_BUFFER_LEN + (hdr.pdu_seq * avg) - (hdr.latency * 2)) % ELASTIC_BUFFER_LEN;
+        if (((ELASTIC_BUFFER_LEN + seq - output_offset) % ELASTIC_BUFFER_LEN) >= (ELASTIC_BUFFER_LEN / 2))
+            output_offset = (output_offset + (ELASTIC_BUFFER_LEN / 2)) % ELASTIC_BUFFER_LEN;
+
+        output_align(st->input->output, prog, hdr.stream_id, output_offset);
 
         parse_hdlc(st, aas_push, st->psd_buf[prog], &st->psd_idx[prog], MAX_AAS_LEN, st->buffer + offset, start + hdr.la_location + 1 - offset, lc);
         offset = start + hdr.la_location + 1;
@@ -544,43 +616,27 @@ void frame_process(frame_t *st, size_t length, logical_channel_t lc)
             unsigned int cnt = start + locations[j] - offset;
             uint8_t crc = crc8(st->buffer + offset, cnt + 1);
 
-            if (crc != 0)
-                log_warn("crc mismatch!");
+            packet_ref_t ref;
+            ref.program = prog;
+            ref.stream_id = hdr.stream_id;
+            ref.data = st->buffer + offset;
+            ref.size = cnt;
+            ref.seq = seq;
+            ref.flags = PACKET_FLAG_NONE;
 
+            if (crc != 0)
+                ref.flags |= PACKET_FLAG_CRC_ERROR;
             if (j == 0 && hdr.pfirst)
-            {
-                unsigned int idx = st->pdu_idx[prog][hdr.stream_id];
-                if (idx)
-                {
-                    if (crc == 0)
-                    {
-                        memcpy(&st->pdu[prog][hdr.stream_id][idx], st->buffer + offset, cnt);
-                        input_pdu_push(st->input, st->pdu[prog][hdr.stream_id], cnt + idx, prog, hdr.stream_id);
-                    }
-                    st->pdu_idx[prog][hdr.stream_id] = 0;
-                }
-                else
-                {
-                    log_debug("ignoring partial pdu");
-                }
-            }
+                ref.shape = PACKET_HALF_BACK;
             else if (j == hdr.nop - 1 && hdr.plast)
-            {
-                if (crc == 0)
-                {
-                    memcpy(st->pdu[prog][hdr.stream_id], st->buffer + offset, cnt);
-                    st->pdu_idx[prog][hdr.stream_id] = cnt;
-                }
-            }
+                ref.shape = PACKET_HALF_FRONT;
             else
-            {
-                if (crc == 0)
-                {
-                    input_pdu_push(st->input, st->buffer + offset, cnt, prog, hdr.stream_id);
-                }
-            }
+                ref.shape = PACKET_FULL;
+
+            output_push(st->input->output, &ref);
 
             offset += cnt + 1;
+            seq = (seq + 1) % ELASTIC_BUFFER_LEN;
         }
     }
 
@@ -659,13 +715,20 @@ void frame_push(frame_t *st, uint8_t *bits, size_t length, logical_channel_t lc)
 
 void frame_reset(frame_t *st)
 {
+    for (int prog = 0; prog < MAX_PROGRAMS; prog++)
+    {
+        st->services[prog].access = -1;
+        st->services[prog].type = -1;
+        st->services[prog].codec_mode = -1;
+        st->services[prog].blend_control = -1;
+        st->services[prog].digital_audio_gain = -1;
+        st->services[prog].common_delay = -1;
+        st->services[prog].latency = -1;
+        }
+
     st->pci = 0;
     for (int prog = 0; prog < MAX_PROGRAMS; prog++)
     {
-        for (int stream_id = 0; stream_id < MAX_STREAMS; stream_id++)
-        {
-            st->pdu_idx[prog][stream_id] = 0;
-        }
         st->psd_idx[prog] = -1;
     }
 

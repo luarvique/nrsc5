@@ -39,11 +39,15 @@ static int do_auto_gain(nrsc5_t *st)
     if (gain_count < 0)
         goto error;
 
-    for (int i = 0; i < gain_count; i++)
-    {
-        int gain = gain_list[i];
+    int low = 0;
+    int high = gain_count - 1;
 
-        if (set_tuner_gain(st, gain_list[i]) != 0)
+    while (low <= high)
+    {
+        int mid = (low + high) / 2;
+        int gain = gain_list[mid];
+
+        if (set_tuner_gain(st, gain) != 0)
             continue;
 
         if (st->rtltcp)
@@ -69,7 +73,7 @@ static int do_auto_gain(nrsc5_t *st)
 
         uint8_t max_sample = 0;
         uint8_t min_sample = 255;
-        for (int j = 0; j < len; j++)
+        for (int j = len/4; j < len; j++)
         {
             if (st->samples_buf[j] > max_sample)
                 max_sample = st->samples_buf[j];
@@ -78,16 +82,27 @@ static int do_auto_gain(nrsc5_t *st)
         }
 
         float amplitude_db = 20 * log10f((max_sample - min_sample + 1) / 256.0f);
-        log_debug("Gain: %.1f dB, Peak amplitude: %.1f dBFS", gain / 10.0f, amplitude_db);
+        nrsc5_report_agc(st, gain / 10.0f, amplitude_db, 0);
 
-        if ((i == 0) || (amplitude_db < -6.0f))
+        if (amplitude_db < -6.0f)
+        {
+            best_gain = gain;
+            best_amplitude_db = amplitude_db;
+            low = mid + 1;
+        }
+        else
+        {
+            high = mid - 1;
+        }
+
+        if (high == -1)
         {
             best_gain = gain;
             best_amplitude_db = amplitude_db;
         }
     }
 
-    log_debug("Best gain: %.1f dB, Peak amplitude: %.1f dBFS", best_gain / 10.0f, best_amplitude_db);
+    nrsc5_report_agc(st, best_gain / 10.0f, best_amplitude_db, 1);
     st->gain = best_gain;
     set_tuner_gain(st, best_gain);
     ret = 0;
@@ -155,7 +170,7 @@ static void *worker_thread(void *arg)
 
             if (st->dev)
             {
-                err = rtlsdr_read_async(st->dev, worker_cb, st, 8, 512 * 1024);
+                err = rtlsdr_read_async(st->dev, worker_cb, st, 120, 32768);
             }
             else if (st->rtltcp)
             {
@@ -286,7 +301,28 @@ void nrsc5_program_type_name(unsigned int type, const char **name)
     }
 }
 
-static nrsc5_t *nrsc5_alloc()
+void nrsc5_alert_category_name(unsigned int type, const char **name)
+{
+    switch (type)
+    {
+    case NRSC5_ALERT_CATEGORY_NON_SPECIFIC: *name = "Non-specific"; break;
+    case NRSC5_ALERT_CATEGORY_GEOPHYSICAL: *name = "Geophysical"; break;
+    case NRSC5_ALERT_CATEGORY_WEATHER: *name = "Weather"; break;
+    case NRSC5_ALERT_CATEGORY_SAFETY: *name = "Safety"; break;
+    case NRSC5_ALERT_CATEGORY_SECURITY: *name = "Security"; break;
+    case NRSC5_ALERT_CATEGORY_RESCUE: *name = "Rescue"; break;
+    case NRSC5_ALERT_CATEGORY_FIRE: *name = "Fire"; break;
+    case NRSC5_ALERT_CATEGORY_HEALTH: *name = "Health"; break;
+    case NRSC5_ALERT_CATEGORY_ENVIRONMENTAL: *name = "Environmental"; break;
+    case NRSC5_ALERT_CATEGORY_TRANSPORTATION: *name = "Transportation"; break;
+    case NRSC5_ALERT_CATEGORY_UTILITIES: *name = "Utilities"; break;
+    case NRSC5_ALERT_CATEGORY_HAZMAT: *name = "Hazmat"; break;
+    case NRSC5_ALERT_CATEGORY_TEST: *name = "Test"; break;
+    default: *name = "Unknown"; break;
+    }
+}
+
+static nrsc5_t *nrsc5_alloc(void)
 {
     nrsc5_t *st = calloc(1, sizeof(*st));
     return st;
@@ -627,6 +663,17 @@ void nrsc5_report_lost_device(nrsc5_t *st)
     nrsc5_report(st, &evt);
 }
 
+void nrsc5_report_agc(nrsc5_t *st, float gain_db, float peak_dbfs, int is_final)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_AGC;
+    evt.agc.gain_db = gain_db;
+    evt.agc.peak_dbfs = peak_dbfs;
+    evt.agc.is_final = is_final;
+    nrsc5_report(st, &evt);
+}
+
 void nrsc5_report_iq(nrsc5_t *st, const void *data, size_t count)
 {
     nrsc5_event_t evt;
@@ -637,11 +684,13 @@ void nrsc5_report_iq(nrsc5_t *st, const void *data, size_t count)
     nrsc5_report(st, &evt);
 }
 
-void nrsc5_report_sync(nrsc5_t *st)
+void nrsc5_report_sync(nrsc5_t *st, float freq_offset, int psmi)
 {
     nrsc5_event_t evt;
 
     evt.event = NRSC5_EVENT_SYNC;
+    evt.sync.freq_offset = freq_offset;
+    evt.sync.psmi = psmi;
     nrsc5_report(st, &evt);
 }
 
@@ -653,14 +702,24 @@ void nrsc5_report_lost_sync(nrsc5_t *st)
     nrsc5_report(st, &evt);
 }
 
-void nrsc5_report_hdc(nrsc5_t *st, unsigned int program, const uint8_t *data, size_t count)
+void nrsc5_report_hdc(nrsc5_t *st, unsigned int program, const packet_t* pkt)
 {
     nrsc5_event_t evt;
 
     evt.event = NRSC5_EVENT_HDC;
     evt.hdc.program = program;
-    evt.hdc.data = data;
-    evt.hdc.count = count;
+    evt.hdc.data = NULL;
+    evt.hdc.count = 0;
+    evt.hdc.flags = NRSC5_PKT_FLAGS_NONE;
+
+    if (pkt->shape == PACKET_FULL)
+    {
+        evt.hdc.data = pkt->data;
+        evt.hdc.count = pkt->size;
+    }
+    if (pkt->flags & PACKET_FLAG_CRC_ERROR)
+        evt.hdc.flags |= NRSC5_PKT_FLAGS_CRC_ERROR;
+
     nrsc5_report(st, &evt);
 }
 
@@ -694,44 +753,73 @@ void nrsc5_report_ber(nrsc5_t *st, float cber)
     nrsc5_report(st, &evt);
 }
 
-void nrsc5_report_stream(nrsc5_t *st, uint16_t port, uint16_t seq, unsigned int size, uint32_t mime, const uint8_t *data)
+void nrsc5_report_stream(nrsc5_t *st, uint16_t seq, unsigned int size, const uint8_t *data,
+                         nrsc5_sig_service_t *service, nrsc5_sig_component_t *component)
 {
     nrsc5_event_t evt;
 
     evt.event = NRSC5_EVENT_STREAM;
-    evt.stream.port = port;
+    evt.stream.port = component->data.port;
     evt.stream.seq = seq;
     evt.stream.size = size;
-    evt.stream.mime = mime;
+    evt.stream.mime = component->data.mime;
     evt.stream.data = data;
+    evt.stream.service = service;
+    evt.stream.component = component;
     nrsc5_report(st, &evt);
 }
 
-void nrsc5_report_packet(nrsc5_t *st, uint16_t port, uint16_t seq, unsigned int size, uint32_t mime, const uint8_t *data)
+void nrsc5_report_packet(nrsc5_t *st, uint16_t seq, unsigned int size, const uint8_t *data,
+                         nrsc5_sig_service_t *service, nrsc5_sig_component_t *component)
 {
     nrsc5_event_t evt;
 
     evt.event = NRSC5_EVENT_PACKET;
-    evt.packet.port = port;
+    evt.packet.port = component->data.port;
     evt.packet.seq = seq;
     evt.packet.size = size;
-    evt.packet.mime = mime;
+    evt.packet.mime = component->data.mime;
     evt.packet.data = data;
+    evt.packet.service = service;
+    evt.packet.component = component;
     nrsc5_report(st, &evt);
 }
 
-void nrsc5_report_lot(nrsc5_t *st, uint16_t port, unsigned int lot, unsigned int size, uint32_t mime, const char *name, const uint8_t *data, struct tm *expiry_utc)
+void nrsc5_report_lot(nrsc5_t *st, int event, unsigned int lot, unsigned int size, uint32_t mime,
+                      const char *name, const uint8_t *data, struct tm *expiry_utc,
+                      nrsc5_sig_service_t *service, nrsc5_sig_component_t *component)
 {
     nrsc5_event_t evt;
 
-    evt.event = NRSC5_EVENT_LOT;
-    evt.lot.port = port;
+    evt.event = event;
+    evt.lot.port = component->data.port;
     evt.lot.lot = lot;
     evt.lot.size = size;
     evt.lot.mime = mime;
     evt.lot.name = name;
     evt.lot.data = data;
     evt.lot.expiry_utc = expiry_utc;
+    evt.lot.service = service;
+    evt.lot.component = component;
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_lot_fragment(nrsc5_t *st, unsigned int lot, unsigned int seq, unsigned int repeat, int is_duplicate,
+                               unsigned int size, unsigned int bytes_so_far, const uint8_t *data,
+                               nrsc5_sig_service_t *service, nrsc5_sig_component_t *component)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_LOT_FRAGMENT;
+    evt.lot_fragment.lot = lot;
+    evt.lot_fragment.seq = seq;
+    evt.lot_fragment.repeat = repeat;
+    evt.lot_fragment.is_duplicate = is_duplicate;
+    evt.lot_fragment.size = size;
+    evt.lot_fragment.bytes_so_far = bytes_so_far;
+    evt.lot_fragment.data = data;
+    evt.lot_fragment.service = service;
+    evt.lot_fragment.component = component;
     nrsc5_report(st, &evt);
 }
 
@@ -759,7 +847,25 @@ static uint8_t convert_sig_service_type(uint8_t type)
     }
 }
 
-void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
+void nrsc5_report_audio_service(nrsc5_t *st, unsigned int program, unsigned int access, unsigned int type, 
+                                unsigned int codec_mode, unsigned int blend_control, int digital_audio_gain,
+                                unsigned int common_delay, unsigned int latency)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_AUDIO_SERVICE;
+    evt.audio_service.access = access;
+    evt.audio_service.program = program;
+    evt.audio_service.type = type;
+    evt.audio_service.codec_mode = codec_mode;
+    evt.audio_service.blend_control = blend_control;
+    evt.audio_service.digital_audio_gain = digital_audio_gain;
+    evt.audio_service.common_delay = common_delay;
+    evt.audio_service.latency = latency;
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services)
 {
     nrsc5_sig_service_t *service = NULL;
     nrsc5_event_t evt;
@@ -767,10 +873,13 @@ void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
     evt.event = NRSC5_EVENT_SIG;
 
     // convert internal structures to public structures
-    for (unsigned int i = 0; i < count; i++)
+    for (unsigned int i = 0; i < MAX_SIG_SERVICES; i++)
     {
         nrsc5_sig_component_t *component = NULL;
         nrsc5_sig_service_t *prev = service;
+
+        if (services[i].type == SIG_SERVICE_NONE)
+            break;
 
         service = calloc(1, sizeof(nrsc5_sig_service_t));
         service->type = convert_sig_service_type(services[i].type);
@@ -799,6 +908,7 @@ void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
                 component->audio.port = internal->audio.port;
                 component->audio.type = internal->audio.type;
                 component->audio.mime = internal->audio.mime;
+                service->audio_component = component;
             }
             else if (internal->type == SIG_COMPONENT_DATA)
             {
@@ -808,6 +918,10 @@ void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
                 component->data.mime = internal->data.mime;
             }
 
+            // cache the service & component records for use in API events
+            internal->service_ext = service;
+            internal->component_ext = component;
+
             if (prevc == NULL)
                 service->components = component;
             else
@@ -816,9 +930,15 @@ void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
     }
 
     nrsc5_report(st, &evt);
+    st->sig_table = evt.sig.services;
+}
+
+void nrsc5_clear_sig(nrsc5_t *st)
+{
+    nrsc5_sig_service_t *service = NULL;
 
     // free the data structures
-    for (service = evt.sig.services; service != NULL; )
+    for (service = st->sig_table; service != NULL; )
     {
         void *p;
         nrsc5_sig_component_t *component;
@@ -834,10 +954,12 @@ void nrsc5_report_sig(nrsc5_t *st, sig_service_t *services, unsigned int count)
         service = service->next;
         free(p);
     }
+    st->sig_table = NULL;
 }
 
 void nrsc5_report_sis(nrsc5_t *st, const char *country_code, int fcc_facility_id, const char *name,
-                      const char *slogan, const char *message, const char *alert,
+                      const char *slogan, const char *message, const char *alert, const uint8_t *cnt, int cnt_length,
+                      int category1, int category2, int location_format, int num_locations, const int *locations,
                       float latitude, float longitude, int altitude, nrsc5_sis_asd_t *audio_services,
                       nrsc5_sis_dsd_t *data_services)
 {
@@ -850,11 +972,144 @@ void nrsc5_report_sis(nrsc5_t *st, const char *country_code, int fcc_facility_id
     evt.sis.slogan = slogan;
     evt.sis.message = message;
     evt.sis.alert = alert;
+    evt.sis.alert_cnt = cnt;
+    evt.sis.alert_cnt_length = cnt_length;
+    evt.sis.alert_category1 = category1;
+    evt.sis.alert_category2 = category2;
+    evt.sis.alert_location_format = location_format;
+    evt.sis.alert_num_locations = num_locations;
+    evt.sis.alert_locations = locations;
     evt.sis.latitude = latitude;
     evt.sis.longitude = longitude;
     evt.sis.altitude = altitude;
     evt.sis.audio_services = audio_services;
     evt.sis.data_services = data_services;
+
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_station_id(nrsc5_t *st, const char *country_code, int fcc_facility_id)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_STATION_ID;
+    evt.station_id.country_code = country_code;
+    evt.station_id.fcc_facility_id = fcc_facility_id;
+
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_station_name(nrsc5_t *st, const char *name)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_STATION_NAME;
+    evt.station_name.name = name;
+
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_station_slogan(nrsc5_t *st, const char *slogan)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_STATION_SLOGAN;
+    evt.station_slogan.slogan = slogan;
+
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_station_message(nrsc5_t *st, const char *message)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_STATION_MESSAGE;
+    evt.station_message.message = message;
+
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_station_location(nrsc5_t *st, float latitude, float longitude, int altitude)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_STATION_LOCATION;
+    evt.station_location.latitude = latitude;
+    evt.station_location.longitude = longitude;
+    evt.station_location.altitude = altitude;
+
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_asd(nrsc5_t *st, unsigned int program, unsigned int access, unsigned int type, unsigned int sound_exp)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_AUDIO_SERVICE_DESCRIPTOR;
+    evt.asd.program = program;
+    evt.asd.access = access;
+    evt.asd.type = type;
+    evt.asd.sound_exp = sound_exp;
+
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_dsd(nrsc5_t *st, unsigned int access, unsigned int type, uint32_t mime_type)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_DATA_SERVICE_DESCRIPTOR;
+    evt.dsd.access = access;
+    evt.dsd.type = type;
+    evt.dsd.mime_type = mime_type;
+
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_emergency_alert(nrsc5_t *st, const char *message, const uint8_t *control_data,
+                                  int control_data_length, int category1, int category2, int location_format,
+                                  int num_locations, const int *locations)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_EMERGENCY_ALERT;
+    evt.emergency_alert.message = message;
+    evt.emergency_alert.control_data = control_data;
+    evt.emergency_alert.control_data_length = control_data_length;
+    evt.emergency_alert.category1 = category1;
+    evt.emergency_alert.category2 = category2;
+    evt.emergency_alert.location_format = location_format;
+    evt.emergency_alert.num_locations = num_locations;
+    evt.emergency_alert.locations = locations;
+
+    nrsc5_report(st, &evt);
+}
+
+void nrsc5_report_here_image(nrsc5_t *st, int image_type, int seq, int n1, int n2, unsigned int timestamp,
+                             float latitude1, float longitude1, float latitude2, float longitude2,
+                             const char *name, unsigned int size, const uint8_t *data)
+{
+    nrsc5_event_t evt;
+
+    evt.event = NRSC5_EVENT_HERE_IMAGE;
+    evt.here_image.image_type = image_type;
+    evt.here_image.seq = seq;
+    evt.here_image.n1 = n1;
+    evt.here_image.n2 = n2;
+#if defined(WIN32) || defined(_WIN32)
+    __time64_t ts = (__time64_t) timestamp;
+    evt.here_image.time_utc = _gmtime64(&ts);
+#else
+    time_t ts = (time_t) timestamp;
+    evt.here_image.time_utc = gmtime(&ts);
+#endif
+    evt.here_image.latitude1 = latitude1;
+    evt.here_image.longitude1 = longitude1;
+    evt.here_image.latitude2 = latitude2;
+    evt.here_image.longitude2 = longitude2;
+    evt.here_image.name = name;
+    evt.here_image.size = size;
+    evt.here_image.data = data;
 
     nrsc5_report(st, &evt);
 }

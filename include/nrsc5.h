@@ -79,7 +79,14 @@ enum
     NRSC5_SIG_COMPONENT_DATA
 };
 
-/**  Represent a channel component.
+enum
+{
+    NRSC5_AAS_TYPE_STREAM = 0,
+    NRSC5_AAS_TYPE_PACKET = 1,
+    NRSC5_AAS_TYPE_LOT = 3
+};
+
+/**  Represents a service component.
  *
  * An element of a linked list that accompanies a nrsc5_sig_service_t
  * describing a component of a SIG record. This provides further
@@ -98,14 +105,14 @@ struct nrsc5_sig_component_t
             uint16_t port;  /**< distinguishes packets for this service */
             /** e.g. NRSC5_SERVICE_DATA_TYPE_AUDIO_RELATED_DATA */
             uint16_t service_data_type;
-            uint8_t type;   /**< 0 for stream, 1 for packet, 3 for LOT */
+            uint8_t type;   /**< NRSC5_AAS_TYPE_STREAM, NRSC5_AAS_TYPE_PACKET, or NRSC5_AAS_TYPE_LOT */
             uint32_t mime;  /**< content, e.g. NRSC5_MIME_STATION_LOGO */
         } data;
         /*! Audio service information
          */
         struct {
             uint8_t port;   /**< distinguishes packets for this service */
-            uint8_t type;   /**< 0 for stream, 1 for packet, 3 for LOT */
+            uint8_t type;   /**< program type, e.g. NRSC5_PROGRAM_TYPE_JAZZ */
             uint32_t mime;  /**< content, e.g. NRSC5_MIME_HDC */
         } audio;
     };
@@ -121,14 +128,19 @@ enum
     NRSC5_SIG_SERVICE_DATA
 };
 
-/**  Represent Station Information Guide (SIG) records
+/**  Represents Station Information Guide (SIG) records
  *
  * Element of a linked list that will accompany an NRSC5_EVENT_SIG type event.
- * Each cell describes a channel (audio or data), with a name, e.g. "MPS"
+ * Each element describes a channel (audio or data), with a name, e.g. "MPS"
  * is used to indicate main program service, "SPS1" to indicate
  * supplemental program service 1.  Each service may include a linked
  * list of type nrsc5_sig_component_t describing its components, which
  * may include both audio and other data.
+ *
+ * Note: Stations which have only a single audio program and no data services
+ * may not broadcast a SIG table. Applications should not assume that a SIG
+ * table will be present. Information about audio services can be obtained
+ * from PDU headers (reported in NRSC5_EVENT_AUDIO_SERVICE events) instead.
  */
 struct nrsc5_sig_service_t
 {
@@ -137,6 +149,7 @@ struct nrsc5_sig_service_t
     uint16_t number;   /**< Channel number: 1,2,3,4 */
     const char *name;  /**< Channel name, e.g. "MPS" or "SPS1" */
     nrsc5_sig_component_t *components; /**< Head of linked list of components */
+    nrsc5_sig_component_t *audio_component; /**< Direct link to the audio component of an audio service, or NULL for a data service */
 };
 /**
  * Defines a typename for struct nrsc5_sig_service_t
@@ -158,7 +171,20 @@ enum
     NRSC5_EVENT_LOT,
     NRSC5_EVENT_SIS,
     NRSC5_EVENT_STREAM,
-    NRSC5_EVENT_PACKET
+    NRSC5_EVENT_PACKET,
+    NRSC5_EVENT_AUDIO_SERVICE,
+    NRSC5_EVENT_STATION_ID,
+    NRSC5_EVENT_STATION_NAME,
+    NRSC5_EVENT_STATION_SLOGAN,
+    NRSC5_EVENT_STATION_MESSAGE,
+    NRSC5_EVENT_STATION_LOCATION,
+    NRSC5_EVENT_AUDIO_SERVICE_DESCRIPTOR,
+    NRSC5_EVENT_DATA_SERVICE_DESCRIPTOR,
+    NRSC5_EVENT_EMERGENCY_ALERT,
+    NRSC5_EVENT_HERE_IMAGE,
+    NRSC5_EVENT_LOT_HEADER,
+    NRSC5_EVENT_LOT_FRAGMENT,
+    NRSC5_EVENT_AGC
 };
 
 enum
@@ -203,17 +229,59 @@ enum
     NRSC5_PROGRAM_TYPE_SPECIAL_READING_SERVICES = 76
 };
 
+enum
+{
+    NRSC5_BLEND_DISABLE,
+    NRSC5_BLEND_SELECT,
+    NRSC5_BLEND_ENABLE
+};
+
+enum
+{
+    NRSC5_LOCATION_FORMAT_SAME,
+    NRSC5_LOCATION_FORMAT_FIPS,
+    NRSC5_LOCATION_FORMAT_ZIP
+};
+
+enum
+{
+    NRSC5_ALERT_CATEGORY_NON_SPECIFIC = 1,
+    NRSC5_ALERT_CATEGORY_GEOPHYSICAL = 2,
+    NRSC5_ALERT_CATEGORY_WEATHER = 3,
+    NRSC5_ALERT_CATEGORY_SAFETY = 4,
+    NRSC5_ALERT_CATEGORY_SECURITY = 5,
+    NRSC5_ALERT_CATEGORY_RESCUE = 6,
+    NRSC5_ALERT_CATEGORY_FIRE = 7,
+    NRSC5_ALERT_CATEGORY_HEALTH = 8,
+    NRSC5_ALERT_CATEGORY_ENVIRONMENTAL = 9,
+    NRSC5_ALERT_CATEGORY_TRANSPORTATION = 10,
+    NRSC5_ALERT_CATEGORY_UTILITIES = 11,
+    NRSC5_ALERT_CATEGORY_HAZMAT = 12,
+    NRSC5_ALERT_CATEGORY_TEST = 30
+};
+
+enum
+{
+    NRSC5_HERE_IMAGE_TRAFFIC = 8,
+    NRSC5_HERE_IMAGE_WEATHER = 13
+};
+
 /**
  * Station Information Service *Audio* service descriptor. This is a
  * linked list element that may point to further audio service
  * descriptor elements.  Refer to NRSC-5 document SY_IDD_1020s.
+ *
+ * Note: Not all stations broadcast SIS audio service descriptors, so
+ * applications should not assume that they will be present. Audio service
+ * data from PDU headers (reported in NRSC5_EVENT_AUDIO_SERVICE events) can
+ * be used instead.
  */
 struct nrsc5_sis_asd_t
 {
     struct nrsc5_sis_asd_t *next; /**< Pointer to next element or NULL */
     unsigned int program;     /**< program number 0, 1, ..., 7 */
     unsigned int access;      /**< NRSC5_ACCESS_PUBLIC or NRSC5_ACCESS_RESTRICTED */
-    unsigned int type;        /**< audio service, e.g. NRSC5_PROGRAM_TYPE_JAZZ */
+    unsigned int type;        /**< program type, e.g. NRSC5_PROGRAM_TYPE_JAZZ */
     unsigned int sound_exp;   /**< 0 is none, 2 is Dolby Pro Logic II Surround */
 };
 /**
@@ -255,13 +323,35 @@ struct nrsc5_sis_dsd_t
 {
     struct nrsc5_sis_dsd_t *next; /**< Pointer to next element or NULL */
     unsigned int access;  /**< NRSC5_ACCESS_PUBLIC or NRSC5_ACCESS_RESTRICTED */
-    unsigned int type; /**< data service type, e.g. NRSC5_SERVICE_DATA_TYPE_TEXT */
+    unsigned int type;    /**< data service type, e.g. NRSC5_SERVICE_DATA_TYPE_TEXT */
     uint32_t mime_type;   /**< MIME type, e.g. `NRSC5_MIME_TEXT` */
 };
 /**
  * Defines a typename for struct nrsc5_sis_dsd_t
  */
 typedef struct nrsc5_sis_dsd_t nrsc5_sis_dsd_t;
+
+/**
+* ID3 comment descriptor. This is a linked list element that may point to further
+* comments via `next` member if not `NULL`.
+* Refer to HD-Radio document SY_IDD_1028s.
+*/
+struct nrsc5_id3_comment_t {
+    struct nrsc5_id3_comment_t *next; /**< Pointer to next element or NULL */
+    char *lang; /**< language code, e.g. "eng" */
+    char *short_content_desc; /**< short content description */
+    char *full_text; /**< full text */
+};
+/**
+ * Defines a typename for struct nrsc5_id3_comment_t
+ */
+typedef struct nrsc5_id3_comment_t nrsc5_id3_comment_t;
+
+enum
+{
+    NRSC5_PKT_FLAGS_NONE = 0,
+    NRSC5_PKT_FLAGS_CRC_ERROR = 1 << 0, /** Failed the CRC check. Could be corrupted packet. */
+};
 
 /**  Incoming event from receiver.
  *
@@ -273,22 +363,33 @@ struct nrsc5_event_t
 {
 /*! Type of event.
  * The member `event` determines which sort of event occurred:
- * - `NRSC5_EVENT_LOST_DEVICE` : signal is over
- * - `NRSC5_EVENT_BER` : Bit Error Ratio data, see the `ber` union member
- * - `NRSC5_EVENT_MER` : modulation error ratio, see the `mer` union member,
- *    and NRSC5 document SY_TN_2646s
+ * - `NRSC5_EVENT_LOST_DEVICE` : RTL-SDR device was disconnected
  * - `NRSC5_EVENT_IQ` : IQ data, see the `iq` union member
+ * - `NRSC5_EVENT_SYNC` : indicates synchronization achieved, see the `sync` union member
+ * - `NRSC5_EVENT_LOST_SYNC` : indicates synchronization lost
+ * - `NRSC5_EVENT_MER` : modulation error ratio, see the `mer` union member, and NRSC5 document SY_TN_2646s
+ * - `NRSC5_EVENT_BER` : Bit Error Ratio data, see the `ber` union member
  * - `NRSC5_EVENT_HDC` : HDC audio packet, see the `hdc` union member
  * - `NRSC5_EVENT_AUDIO` : audio buffer, see the `audio` union member
- * - `NRSC5_EVENT_SYNC` : indicates synchronization achieved
- * - `NRSC5_EVENT_LOST_SYNC` : indicates synchronization lost
- * - `NRSC5_EVENT_ID3` : ID3 information packet arrived, see `id3` member
- *    and information in HD-Radio document SY_IDD_1028s.
+ * - `NRSC5_EVENT_ID3` : ID3 information packet arrived, see `id3` member and information in HD-Radio document SY_IDD_1028s.
  * - `NRSC5_EVENT_SIG` : service information arrived, see `sig` member
+ * - `NRSC5_EVENT_LOT` : LOT file data available, see `lot` member
+ * - `NRSC5_EVENT_LOT_HEADER` : LOT file header metadata available, see `lot` member
+ * - `NRSC5_EVENT_LOT_FRAGMENT` : fragment of a LOT file received, see `lot_fragment` member
+ * - `NRSC5_EVENT_SIS` : DEPRECATED. Use `NRSC5_EVENT_STATION_ID`, `NRSC5_EVENT_STATION_NAME`, `NRSC5_EVENT_STATION_SLOGAN`, `NRSC5_EVENT_STATION_MESSAGE`, `NRSC5_EVENT_STATION_LOCATION`, `NRSC5_EVENT_AUDIO_SERVICE_DESCRIPTOR`, `NRSC5_EVENT_DATA_SERVICE_DESCRIPTOR`, and `NRSC5_EVENT_EMERGENCY_ALERT` instead.
  * - `NRSC5_EVENT_STREAM` : stream data available, see `stream` member
  * - `NRSC5_EVENT_PACKET` : packet data available, see `packet` member
- * - `NRSC5_EVENT_LOT` : LOT file data available, see `lot` member
- * - `NRSC5_EVENT_SIS` : station information, see `sis` member
+ * - `NRSC5_EVENT_AUDIO_SERVICE` : audio service available, see `audio_service` member
+ * - `NRSC5_EVENT_STATION_ID` : station ID number, see `station_id` member
+ * - `NRSC5_EVENT_STATION_NAME` : station name, see `station_name` member
+ * - `NRSC5_EVENT_STATION_SLOGAN` : station slogan, see `station_slogan` member
+ * - `NRSC5_EVENT_STATION_MESSAGE` : station message, see `station_message` member
+ * - `NRSC5_EVENT_STATION_LOCATION` : station location, see `station_location` member
+ * - `NRSC5_EVENT_AUDIO_SERVICE_DESCRIPTOR` : SIS audio service descriptor, see `asd` member
+ * - `NRSC5_EVENT_DATA_SERVICE_DESCRIPTOR` : SIS data service descriptor, see `dsd` member
+ * - `NRSC5_EVENT_EMERGENCY_ALERT` : emergency alert, see `emergency_alert` member
+ * - `NRSC5_EVENT_HERE_IMAGE` : HERE Images traffic/weather map, see `here_image` member
+ * - `NRSC5_EVENT_AGC` : automatic gain control status, see `agc` member
  */
     unsigned int event;
     union
@@ -297,6 +398,10 @@ struct nrsc5_event_t
             const void *data;
             size_t count;
         } iq;
+        struct {
+            float freq_offset; /**< Frequency offset in Hz */
+            int psmi;          /**< Primary Service Mode Indicator (1, 2, 3, 5, 6, or 11 for FM; 1 or 2 for AM) */
+        } sync;
         struct {
             float cber;
         } ber;
@@ -308,6 +413,7 @@ struct nrsc5_event_t
             unsigned int program;
             const uint8_t *data;
             size_t count;
+            unsigned int flags; /** The specific status of the hdc packet. Example `NRSC5_PKT_FLAGS_CRC_ERROR` **/
         } hdc;
         struct {
             unsigned int program;
@@ -329,30 +435,58 @@ struct nrsc5_event_t
                 int param;
                 int lot;
             } xhdr;
+            nrsc5_id3_comment_t *comments;
         } id3;
         struct {
-            uint16_t port;
+            uint16_t port;  /**< DEPRECATED: Use `component->data.port` instead */
             uint16_t seq;
             unsigned int size;
-            uint32_t mime;
+            uint32_t mime;  /**< DEPRECATED: Use `component->data.mime` instead */
             const uint8_t *data;
+            nrsc5_sig_service_t *service;
+            nrsc5_sig_component_t *component;
         } stream;
         struct {
-            uint16_t port;
+            uint16_t port;  /**< DEPRECATED: Use `component->data.port` instead */
             uint16_t seq;
             unsigned int size;
-            uint32_t mime;
+            uint32_t mime;  /**< DEPRECATED: Use `component->data.mime` instead */
             const uint8_t *data;
+            nrsc5_sig_service_t *service;
+            nrsc5_sig_component_t *component;
         } packet;
         struct {
-            uint16_t port;
-            unsigned int lot;
-            unsigned int size;
-            uint32_t mime;
-            const char *name;
-            const uint8_t *data;
-            struct tm *expiry_utc;
+            uint16_t port;                    /**< DEPRECATED: Use `component->data.port` instead */
+            unsigned int lot;                 /**< LOT id of the file */
+            unsigned int size;                /**< number of bytes in the file */
+            uint32_t mime;                    /**< MIME type of the file, e.g. NRSC5_MIME_PNG */
+            const char *name;                 /**< filename */
+            const uint8_t *data;              /**< contents of the file (if the event type is NRSC5_EVENT_LOT), or NULL (if the event type is NRSC5_EVENT_LOT_HEADER) */
+            struct tm *expiry_utc;            /**< time after which the file should be deleted */
+            nrsc5_sig_service_t *service;     /**< pointer to the associated SIG service */
+            nrsc5_sig_component_t *component; /**< pointer to the associated SIG component */
         } lot;
+        struct {
+            unsigned int lot;                 /**< LOT id of the file this fragment belongs to */
+            unsigned int seq;                 /**< sequence number of this fragment within the LOT file */
+            unsigned int repeat;              /**< number of repetitions remaining */
+            unsigned int size;                /**< number of bytes in this fragment */
+            unsigned int bytes_so_far;        /**< total number of bytes received for this LOT file, across all received fragments */
+            int is_duplicate;                 /**< 1 if this fragment was previously received, otherwise 0 */
+            const uint8_t *data;              /**< pointer to the data bytes of this fragment */
+            nrsc5_sig_service_t *service;     /**< pointer to the associated SIG service */
+            nrsc5_sig_component_t *component; /**< pointer to the associated SIG component */
+        } lot_fragment;
+        struct {
+            unsigned int program;       /**< program number 0, 1, ..., 7 */
+            unsigned int access;        /**< NRSC5_ACCESS_PUBLIC or NRSC5_ACCESS_RESTRICTED */
+            unsigned int type;          /**< program type, e.g. NRSC5_PROGRAM_TYPE_JAZZ */
+            unsigned int codec_mode;    /**< audio codec mode. See SY_IDD_1017s Table 5-2. */
+            unsigned int blend_control; /**< blend control (NRSC5_BLEND_DISABLE, NRSC5_BLEND_SELECT, or NRSC5_BLEND_ENABLE). See SY_IDD_1017s section 5.2.1.2. */
+            int digital_audio_gain;     /**< TX digital audio gain, in dB. See SY_IDD_1017s section 5.2.1.3. */
+            unsigned int common_delay;  /**< post-decoded common delay, in audio frame periods. See SY_IDD_1017s Table 5-1. */
+            unsigned int latency;       /**< audio codec latency, in audio frame periods. See SY_IDD_1017s Table 5-1. */
+        } audio_service;
         struct {
             nrsc5_sig_service_t *services;
         } sig;
@@ -368,7 +502,72 @@ struct nrsc5_event_t
             int altitude;
             nrsc5_sis_asd_t *audio_services;
             nrsc5_sis_dsd_t *data_services;
+            const uint8_t *alert_cnt;
+            int alert_cnt_length;
+            int alert_category1;
+            int alert_category2;
+            int alert_location_format;
+            int alert_num_locations;
+            const int *alert_locations;
         } sis;
+        struct {
+            const char *country_code;
+            int fcc_facility_id;
+        } station_id;
+        struct {
+            const char *name;
+        } station_name;
+        struct {
+            const char *slogan;
+        } station_slogan;
+        struct {
+            const char *message;
+        } station_message;
+        struct {
+            float latitude;
+            float longitude;
+            int altitude;
+        } station_location;
+        struct {
+            unsigned int program;     /**< program number 0, 1, ..., 7 */
+            unsigned int access;      /**< NRSC5_ACCESS_PUBLIC or NRSC5_ACCESS_RESTRICTED */
+            unsigned int type;        /**< program type, e.g. NRSC5_PROGRAM_TYPE_JAZZ */
+            unsigned int sound_exp;   /**< 0 is none, 2 is Dolby Pro Logic II Surround */        
+        } asd;
+        struct {
+            unsigned int access;  /**< NRSC5_ACCESS_PUBLIC or NRSC5_ACCESS_RESTRICTED */
+            unsigned int type;    /**< data service type, e.g. NRSC5_SERVICE_DATA_TYPE_TEXT */
+            uint32_t mime_type;   /**< MIME type, e.g. `NRSC5_MIME_TEXT` */        
+        } dsd;
+        struct {
+            const char *message;
+            const uint8_t *control_data;
+            int control_data_length;
+            int category1;
+            int category2;
+            int location_format;
+            int num_locations;
+            const int *locations;
+        } emergency_alert;
+        struct {
+            int image_type;      /**< NRSC5_HERE_IMAGE_TRAFFIC or NRSC5_HERE_IMAGE_WEATHER */
+            int seq;             /**< sequence number (1-15); increments when traffic/weather image changes */
+            int n1;              /**< part number (1-9) for traffic, or incrementing sequence number for weather */
+            int n2;              /**< number of parts (9) for traffic, or incrementing sequence number for weather */
+            struct tm *time_utc; /**< UTC time of traffic or weather image */
+            float latitude1;     /**< latitude of north map edge */
+            float longitude1;    /**< longitude of west map edge */
+            float latitude2;     /**< latitude of south map edge */
+            float longitude2;    /**< longitude of east map edge */
+            const char *name;    /**< filename, e.g. "trafficMap_1_2_rdhs.png" or "WeatherImage_0_0_rdhs.png" */
+            unsigned int size;   /**< size of image file, in bytes */
+            const uint8_t *data; /**< contents of image file */
+        } here_image;
+        struct {
+            float gain_db;       /**< SDR gain value in dB */
+            float peak_dbfs;     /**< peak signal amplitude in dB, relative to full scale */
+            int is_final;        /**< 1 if this is the final (best) gain value, otherwise 0 */
+        } agc;
     };
 };
 /**
@@ -408,21 +607,31 @@ NRSC5_API void nrsc5_get_version(const char **version);
  * @param[out] name  character pointer to a string naming the service type
  *
  * This name will be quite short, e.g. "News" or "Weather". If the type is
- * not recognized, it will the string "Unknown".
+ * not recognized, it will be the string "Unknown".
  */
 NRSC5_API void nrsc5_service_data_type_name(unsigned int type, const char **name);
 
 /**
  * Retrieves a string corresponding to a program type.
- * @param[in]  type  a protram data type integer.
+ * @param[in]  type  a program data type integer.
  * @param[out] name  character pointer to a string naming the service type
  *
  * This name will be quite short, e.g. "News" or "Rock". If the type is
- * not recognized, it will the string "Unknown".
+ * not recognized, it will be the string "Unknown".
  */
 NRSC5_API void nrsc5_program_type_name(unsigned int type, const char **name);
 
 /**
+ * Retrieves a string corresponding to an alert category.
+ * @param[in]  type  an alert category integer.
+ * @param[out] name  character pointer to a string naming the alert category
+ *
+ * This name will be quite short, e.g. "Weather" or "Safety". If the type is
+ * not recognized, it will be the string "Unknown".
+ */
+ NRSC5_API void nrsc5_alert_category_name(unsigned int category, const char **name);
+ 
+ /**
  * Initializes a session for a particular RTLSDR radio dongle.
  * @param[out] st  handle for an nrsc5_t
  * @param[in]  device_index  the RTLSDR device index

@@ -105,6 +105,8 @@ void acquire_process(acquire_t *st)
     if (st->idx != (unsigned int)st->fftcp * (ACQUIRE_SYMBOLS + 1))
         return;
 
+    output_advance(st->input->output);
+
     if (st->input->sync_state == SYNC_STATE_FINE)
     {
         samperr = st->fftcp / 2 + st->input->sync.samperr;
@@ -254,23 +256,20 @@ void acquire_process(acquire_t *st)
         sync_push(&st->input->sync, st->fftout);
     }
 
-    keep = st->fftcp + (st->fftcp / 2 - samperr);
+    keep = st->fftcp + (st->fftcp / 2 - samperr) + st->keep_extra;
+    st->keep_extra = 0;
     memmove(&st->in_buffer[0], &st->in_buffer[st->idx - keep], sizeof(cint16_t) * keep);
     st->idx = keep;
 }
 
+void acquire_keep_extra(acquire_t *st, int extra)
+{
+    st->keep_extra = extra;
+}
+
 void acquire_cfo_adjust(acquire_t *st, int cfo)
 {
-    float hz;
-
-    if (cfo == 0)
-        return;
-
     st->cfo += cfo;
-    hz = (float) st->cfo * NRSC5_SAMPLE_RATE_CU8 / st->fft;
-    hz /= (st->mode == NRSC5_MODE_FM ? DECIMATION_FACTOR_FM : DECIMATION_FACTOR_AM);
-
-    log_info("CFO: %f Hz", hz);
 }
 
 unsigned int acquire_push(acquire_t *st, cint16_t *buf, unsigned int length)
@@ -293,6 +292,7 @@ void acquire_reset(acquire_t *st)
     st->idx = 0;
     st->prev_angle = 0;
     st->phase = 1;
+    st->keep_extra = 0;
     st->cfo = 0;
 }
 
@@ -311,8 +311,8 @@ void acquire_init(acquire_t *st, input_t *input)
     st->filter_am = firdecim_q15_create(filter_taps_am, sizeof(filter_taps_am) / sizeof(filter_taps_am[0]));
 
     pthread_mutex_lock(&fftw_mutex);
-    st->fft_plan_fm = fftwf_plan_dft_1d(FFT_FM, st->fftin, st->fftout, FFTW_FORWARD, 0);
-    st->fft_plan_am = fftwf_plan_dft_1d(FFT_AM, st->fftin, st->fftout, FFTW_FORWARD, 0);
+    st->fft_plan_fm = fftwf_plan_dft_1d(FFT_FM, st->fftin, st->fftout, FFTW_FORWARD, FFTW_ESTIMATE);
+    st->fft_plan_am = fftwf_plan_dft_1d(FFT_AM, st->fftin, st->fftout, FFTW_FORWARD, FFTW_ESTIMATE);
     pthread_mutex_unlock(&fftw_mutex);
 
     for (i = 0; i < FFTCP_FM; ++i)

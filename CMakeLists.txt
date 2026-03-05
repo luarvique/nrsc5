@@ -1,4 +1,5 @@
-cmake_minimum_required (VERSION 3.5)
+cmake_minimum_required (VERSION 3.10)
+cmake_policy (VERSION 3.10...3.28)
 include (CheckLibraryExists)
 include (CheckSymbolExists)
 include (ExternalProject)
@@ -15,7 +16,9 @@ option (USE_SYSTEM_FFTW "Use system provided fftw" ON)
 option (USE_SYSTEM_RTLSDR "Use system provided rtl-sdr" ON)
 option (USE_SYSTEM_LIBUSB "Use system provided libusb" ON)
 option (USE_SYSTEM_LIBAO "Use system provided libao" ON)
+option (INSTALLED_FAAD_IS_PATCHED "Use patched system-provided FAAD2" OFF)
 option (BUILD_DOC "Build API documentation" OFF)
+option (BUILD_CLI "Build nrsc5 executable" ON)
 
 set (FAAD2_CMAKE_ARGS "" CACHE STRING "Extra arguments for FAAD2 cmake command")
 set (LIBRARY_DEBUG_LEVEL "5" CACHE STRING "Debug logging level for libnrsc5: 1=debug, 2=info, 3=warn, 4=error, 5=none")
@@ -70,7 +73,7 @@ if (USE_SYSTEM_LIBUSB)
         set (USE_SYSTEM_LIBUSB OFF)
     endif ()
 endif ()
-if (USE_SYSTEM_LIBAO)
+if (BUILD_CLI AND USE_SYSTEM_LIBAO)
     find_library (AO_LIBRARIES ao)
     pkg_search_module(AO ao)
     if (NOT AO_LIBRARIES)
@@ -155,11 +158,12 @@ if (NOT USE_SYSTEM_RTLSDR)
         rtlsdr_external
         TIMEOUT 120
         GIT_REPOSITORY "https://gitea.osmocom.org/sdr/rtl-sdr.git"
-        GIT_TAG b85f037d85fa5382c3e88463184b77b273cd1091
+        GIT_TAG v2.0.2
         PREFIX ${RTLSDR_PREFIX}
 
         UPDATE_COMMAND ""
         CMAKE_ARGS
+            -DCMAKE_C_FLAGS:STRING="-std=gnu17"
             -DCMAKE_INSTALL_PREFIX:STRING=${RTLSDR_PREFIX}
             -DCMAKE_C_COMPILER:STRING=${CMAKE_C_COMPILER}
             -DCMAKE_SYSTEM_NAME:STRING=${CMAKE_SYSTEM_NAME}
@@ -179,7 +183,7 @@ if (NOT USE_SYSTEM_RTLSDR)
     set (RTL_SDR_BUILTIN rtlsdr)
 endif ()
 
-if (NOT USE_SYSTEM_LIBAO)
+if (BUILD_CLI AND NOT USE_SYSTEM_LIBAO)
     if (NOT WIN32)
         message (FATAL_ERROR "Built-in libao only supported on Windows.")
     endif ()
@@ -214,34 +218,59 @@ if (NOT USE_SYSTEM_LIBAO)
 endif ()
 
 if (USE_FAAD2)
-    set (FAAD2_PREFIX "${CMAKE_BINARY_DIR}/faad2-prefix")
-    ExternalProject_Add (
-        faad2_external
-        TIMEOUT 120
-        GIT_REPOSITORY "https://github.com/knik0/faad2.git"
-        GIT_TAG 2.11.2
-        PREFIX ${FAAD2_PREFIX}
+    # use patched faad if installed
+    if (INSTALLED_FAAD_IS_PATCHED)
+        message(STATUS "Try using patched system-provided FAAD2 library")
+        pkg_search_module(PC_FAAD2 QUIET faad2)
 
-        UPDATE_COMMAND ""
-        PATCH_COMMAND patch -p1 -Ni "${CMAKE_SOURCE_DIR}/support/faad2-hdc-support.patch" || exit 0
+        find_path(FAAD2_INCLUDE_DIRS neaacdec.h
+                HINTS ${PC_FAAD2_INCLUDEDIR} ${PC_FAAD2_INCLUDE_DIRS})
 
-        CMAKE_ARGS
-        -DBUILD_SHARED_LIBS:BOOL=OFF
-        -DCMAKE_INSTALL_PREFIX:STRING=${FAAD2_PREFIX}
-        -DCMAKE_C_COMPILER:STRING=${CMAKE_C_COMPILER}
-        -DCMAKE_SYSTEM_NAME:STRING=${CMAKE_SYSTEM_NAME}
-        "-DCMAKE_C_FLAGS=${CMAKE_C_FLAGS} -O2 -fPIC"
-        ${FAAD2_CMAKE_ARGS}
-    )
+        # use the libfaad_hdc.a, not libfaad as specified in pkg-config file
+        find_library(FAAD2_LIBRARIES NAMES faad_hdc
+                HINTS ${PC_FAAD2_LIBDIR} ${PC_FAAD2_LIBRARY_DIRS} )
 
-    add_library (faad2 STATIC IMPORTED)
-    set_property (TARGET faad2 PROPERTY IMPORTED_LOCATION "${FAAD2_PREFIX}/lib/libfaad_hdc.a")
-    add_dependencies (faad2 faad2_external)
+        if (FAAD2_INCLUDE_DIRS AND FAAD2_LIBRARY)
+            set(FAAD2_FOUND ON)
+        else ()
+            message (WARNING "FAAD2 patched not found. Building from source.")
+        endif()
+    endif()
 
-    set (FAAD2_INCLUDE_DIRS "${FAAD2_PREFIX}/include")
-    set (FAAD2_LIBRARIES faad2)
-    add_definitions (-DHAVE_FAAD2)
-    set (FAAD2_BUILTIN faad2)
+    if (NOT FAAD2_FOUND)
+        set (FAAD2_PREFIX "${CMAKE_BINARY_DIR}/faad2-prefix")
+        ExternalProject_Add (
+            faad2_external
+            TIMEOUT 120
+            GIT_REPOSITORY "https://github.com/knik0/faad2.git"
+            GIT_TAG 2.11.2
+            PREFIX ${FAAD2_PREFIX}
+
+            UPDATE_COMMAND ""
+            PATCH_COMMAND patch -p1 -Ni "${CMAKE_SOURCE_DIR}/support/faad2-hdc-support.patch" || exit 0
+
+            CMAKE_ARGS
+            -DBUILD_SHARED_LIBS:BOOL=OFF
+            -DCMAKE_INSTALL_PREFIX:STRING=${FAAD2_PREFIX}
+            -DCMAKE_C_COMPILER:STRING=${CMAKE_C_COMPILER}
+            -DCMAKE_SYSTEM_NAME:STRING=${CMAKE_SYSTEM_NAME}
+            "-DCMAKE_C_FLAGS=${CMAKE_C_FLAGS} -O2 -fPIC"
+            ${FAAD2_CMAKE_ARGS}
+        )
+
+        add_library (faad2 STATIC IMPORTED)
+        set_property (TARGET faad2 PROPERTY IMPORTED_LOCATION "${FAAD2_PREFIX}/lib/libfaad_hdc.a")
+        add_dependencies (faad2 faad2_external)
+
+        set (FAAD2_INCLUDE_DIRS "${FAAD2_PREFIX}/include")
+        set (FAAD2_LIBRARIES faad2)
+        set (FAAD2_BUILTIN faad2)
+        set (FAAD2_FOUND ON)
+    endif()
+
+    if (FAAD2_FOUND)
+        add_definitions (-DHAVE_FAAD2)
+    endif()
 else ()
     # we only use libao with faad2
     unset (AO_INCLUDE_DIRS)
